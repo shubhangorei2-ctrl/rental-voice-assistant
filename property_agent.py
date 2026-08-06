@@ -35,7 +35,7 @@ from typing import Annotated
 import os
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path='/Users/sunitakhandelwal/Desktop/research-paper-AI/blokminers/whatsapp_enabled/.env')
+load_dotenv()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Everything (LLM calls, generated SQL, DB errors, call lifecycle) goes through
