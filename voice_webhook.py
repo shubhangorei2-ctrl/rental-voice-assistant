@@ -19,6 +19,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
 
 # import all nodes and state from your existing file
 # (this import also runs property_agent's logging.basicConfig(), so the
@@ -46,15 +48,30 @@ logger = logging.getLogger("property_agent.webhook")
 # ── Global definitions (populated during lifespan) ───────────────────────────
 checkpointer = None
 graph = None
+db_pool = None
 
 # ── Lifespan Context Manager ──────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global checkpointer, graph
+    global checkpointer, graph, db_pool
 
-    logger.info("Startup: connecting checkpointer and compiling graph...")
-    postgres_saver = PostgresSaver.from_conn_string(DB_URI)
-    checkpointer = postgres_saver.__enter__()
+    logger.info("Startup: opening checkpointer connection pool and compiling graph...")
+    # A single long-lived connection (the old PostgresSaver.from_conn_string
+    # approach) silently dies on Neon's idle auto-suspend or any network blip
+    # and never reconnects -- every call then fails with "the connection is
+    # closed" until the process is restarted (seen in production). A pool with
+    # check=check_connection health-checks each connection on checkout and
+    # transparently discards/replaces dead ones, so the webhook self-heals.
+    # kwargs match what from_conn_string sets, which PostgresSaver requires.
+    db_pool = ConnectionPool(
+        conninfo=DB_URI,
+        max_size=20,
+        kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
+        check=ConnectionPool.check_connection,
+        open=False,
+    )
+    db_pool.open()
+    checkpointer = PostgresSaver(db_pool)
     checkpointer.setup()
 
     # interrupt_before "nl_to_sql" lets _sse_stream_with_filler peek at
@@ -69,8 +86,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    logger.info("Shutting down: closing checkpointer connection")
-    postgres_saver.__exit__(None, None, None)
+    logger.info("Shutting down: closing checkpointer connection pool")
+    db_pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
