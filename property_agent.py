@@ -65,7 +65,7 @@ def _ctx(state: dict) -> str:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DB_URI = os.getenv("DB_URI", "postgresql://postgres:1234@localhost:5432/postgres?sslmode=prefer&connect_timeout=10")
+DB_URI = os.getenv("DB_URI")
 # DB_URI = "postgresql://postgres:1234@localhost:5432/postgres?sslmode=prefer&connect_timeout=10"
 
 # print(API_KEY)
@@ -97,7 +97,7 @@ class AppState(TypedDict):
     preference_updates: dict   # extracted this turn, cleared after write
     search_query      : str    # natural language, extracted this turn
     sql_query         : str    # generated from search_query
-    search_results    : list   # rows from listings table
+    search_results    : list   # rows from the "Property" table
     reply             : str    # clean reply text (no tags)
 
     # ── Booking / visit-confirmation sub-flow ──────────────────────────────
@@ -259,20 +259,40 @@ def delete_thread(phone_number: str, thread_id: str) -> None:
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
+# Preferences live in "Voice-user-pref": the same typed shape as Prisma's
+# "UserPreference", but keyed by phone_number instead of userId, since a voice
+# caller has no Google account to hang a userId off. The old `preferences`
+# table squeezed all of this into bhk/min_amount/max_amount plus two free-text
+# columns, so amenities, furnishing and rent-vs-buy had nowhere to live and
+# were re-guessed from prose on every single query.
+PREF_TABLE = '"Voice-user-pref"'
+PREF_COLUMNS = ("city", "locality", "listingType", "bhk", "minArea", "maxArea",
+                "minPrice", "maxPrice", "amenities", "furnishing", "otherPreference")
+
+LISTING_TYPES = {"RENT", "SALE"}
+FURNISHINGS = {"UNFURNISHED", "SEMI_FURNISHED", "FURNISHED"}
+
+
 def load_preferences(state: AppState) -> dict:
+    cols = ", ".join(f'"{c}"' for c in PREF_COLUMNS)
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT bhk, min_amount, max_amount, area, other_pref FROM preferences WHERE phone_number = %s",
+            f"SELECT {cols} FROM {PREF_TABLE} WHERE phone_number = %s",
             (state["phone_number"],)
         ).fetchone()
-    prefs = {k: v for k, v in row.items() if v is not None} if row else {}
+    prefs = {k: v for k, v in row.items() if v not in (None, [])} if row else {}
     logger.info(f"{_ctx(state)} load_preferences -> {prefs}")
     return {"preferences": prefs}
 
 
-SYSTEM_PROMPT   = """You are a helpful property search assistant for rental properties in Bangalore.
+SYSTEM_PROMPT   = """You are a helpful property search assistant for properties to rent and to buy across major Indian cities.
 
 User's saved preferences: {preferences}
+
+Every city and locality we actually have, as "City: its localities":
+{known_locations}
+Never name a city or locality outside that list, and never describe a specific property
+unless it was returned by a search earlier in this conversation.
 
 ═══ HOW TO THINK BEFORE RESPONDING ═══
 
@@ -302,7 +322,7 @@ STEP 2 — Has the user mentioned any new preference right now?
   - "i like HSR" → area preference
   - "something affordable" → not specific enough, skip
   - "i prefer 2bhk" → bhk preference
-  - "pet friendly would be nice" → other_pref
+  - "pet friendly would be nice" → otherPreference
 
 STEP 3 — Does the user want to see property listings RIGHT NOW?
   Think: Did they explicitly or clearly ask to find/show/search/list properties?
@@ -347,30 +367,82 @@ FINALIZE: <only if step 5 says yes — json describing the finalized property>
 - REPLY is mandatory every time
 - PREF_UPDATE, SEARCH, and FINALIZE are optional — include only when your thinking above justifies it
 - Nothing before REPLY, nothing after the last tag you include
-- PREF_UPDATE keys: bhk (int), min_amount (int), max_amount (int), area (str), other_pref (str)
+- PREF_UPDATE keys — use the right one, never invent others:
+    city (str)             a city from the list above, e.g. "Mumbai"
+    locality (str)         a locality from the list above, e.g. "Worli"
+    listingType (str)      "RENT" or "SALE" — record it as soon as you know which
+    bhk (int)
+    minPrice / maxPrice    numbers; monthly rent for RENT, total price for SALE
+    minArea / maxArea      floor size in square feet
+    amenities (list)       e.g. ["gym", "swimming pool"] — real amenities only
+    furnishing (str)       "UNFURNISHED", "SEMI_FURNISHED" or "FURNISHED"
+    otherPreference (str)  anything genuinely not covered above
+  City and locality are separate: "Worli" is locality "Worli" with city "Mumbai".
+  Never put a region like "NCR" in city or locality — regions belong in SEARCH, not storage.
 - FINALIZE keys: area (str), bhk (int), rent (int), amenities (str) — only the ones you actually know
-- Budget hints: "under 25k" → max_amount: 25000 | "above 10k" → min_amount: 10000 | "around 25k" → max_amount: 25000
+- Budget hints: "under 25k" → maxPrice: 25000 | "above 10k" → minPrice: 10000 | "around 25k" → maxPrice: 25000
 - If user's name is known from conversation, use it naturally in REPLY
 - Strictly Never under any circumstance hallucinate or fabricate properties on your own.
 - If the user states ANY concrete preference in this message (bhk, area, budget, amenity),
   you MUST include a PREF_UPDATE line with those fields -- even when the same message also
   triggers SEARCH or FINALIZE. Skipping PREF_UPDATE loses the customer's preference forever.
+- Only record what the CUSTOMER chose. If you offered "Electronic City or Whitefield?" and they
+  answered something else, no area was chosen -- do not save one. Never put two places in `area`.
+- A saved preference stays in force until it is replaced or withdrawn, so when the customer
+  DROPS one, send that key as null. Omitting the key keeps the old value forever and silently
+  narrows every later search.
+    "any budget, I don't care about price" -> PREF_UPDATE: {{"minPrice": null, "maxPrice": null}}
+    "anywhere is fine now"                 -> PREF_UPDATE: {{"city": null, "locality": null}}
+    "forget everything, start over"        -> PREF_UPDATE: {{"city": null, "locality": null, "listingType": null, "bhk": null, "minPrice": null, "maxPrice": null, "amenities": null, "furnishing": null, "otherPreference": null}}
+  When they REPLACE one instead ("actually make it 4bhk"), just send the new value.
+- When the customer switches between renting and buying, any budget they gave for the old mode
+  no longer applies -- send the budget keys as null unless they restate a figure.
+
+═══ WRITING THE SEARCH LINE ═══
+
+Whoever builds the SQL sees ONLY your SEARCH line -- not this conversation. So SEARCH must
+restate every constraint that is still in force, even ones agreed several turns ago:
+whether they are renting or buying, bhk, the city and/or locality, the budget, and any
+amenity or furnishing. A SEARCH line that drops the city searches the whole country, and
+one that drops "buying" quietly returns rentals.
+
+  Conversation so far: they said Mumbai, then "4bhk to buy"
+  BAD  -> SEARCH: 4bhk to buy
+  GOOD -> SEARCH: 4BHK to buy in Mumbai
+
+If the customer names a region rather than a city (NCR, Delhi NCR, MMR, tri-city), keep the
+region word in the SEARCH line -- the SQL step knows which cities each region covers.
+
+═══ SPEAKING TO A CALLER ═══
+
+Every REPLY is read aloud by text-to-speech. Write words a person would say:
+- No markdown, no bullet points, no numbered lists, no asterisks, no headings, no emoji.
+- No digits and no symbols: say "twenty five thousand rupees a month", never "25,000" or "₹25000/mo".
+  Indian scale: 5000000 is "fifty lakh", 10000000 is "one crore" -- never "million".
+- Never mention REPLY, PREF_UPDATE, SEARCH or FINALIZE inside the REPLY text, and never explain
+  to the caller what you are or aren't recording. They are internal.
+- Never describe the same property twice. If you already told them about a place earlier in this
+  conversation and they ask for others, say plainly that it's the only match rather than
+  re-listing it as if it were new.
+- You can only speak about properties returned by a search in THIS conversation. For anything the
+  search didn't give you -- pet rules, deposit, maintenance charges, legal or society terms --
+  say you'll have to check and offer to connect them, rather than guessing.
 
 ═══ WORKED EXAMPLES (follow these shapes exactly) ═══
 
 Example 1 -- a search request that states preferences (most common case):
-User says: "show me 2bhk flats in HSR under 25000"
+User says: "show me 2bhk flats in Whitefield under 25000"
 
-REPLY: Sure! Let me pull up 2BHK options in HSR under twenty-five thousand for you.
-PREF_UPDATE: {{"bhk": 2, "max_amount": 25000, "area": "HSR"}}
-SEARCH: 2BHK flats in HSR under 25000
+REPLY: Sure! Let me pull up 2BHK options in Whitefield under twenty-five thousand for you.
+PREF_UPDATE: {{"bhk": 2, "maxPrice": 25000, "listingType": "RENT", "city": "Bengaluru", "locality": "Whitefield"}}
+SEARCH: 2BHK flats to rent in Whitefield, Bengaluru under 25000
 
 Example 2 -- a finalize turn that also mentions a preference:
 Conversation so far included: "There's one for eighteen thousand, pet-friendly, in HSR, 2BHK."
 User now says: "I'll take the 18k one, pet friendly is important to me"
 
 REPLY: Great choice! I'll get the details of that pet-friendly 2BHK in HSR at eighteen thousand a month sent over. Could you share your email address so I can send it to you along with a visit invite?
-PREF_UPDATE: {{"other_pref": "pet friendly"}}
+PREF_UPDATE: {{"otherPreference": "pet friendly"}}
 FINALIZE: {{"area": "HSR", "bhk": 2, "rent": 18000, "amenities": "pet friendly"}}
 
 Every time step 5's answer is yes, your output MUST include a FINALIZE line in exactly this
@@ -387,7 +459,10 @@ def chat(state: AppState) -> dict:
     logger.info(f"{_ctx(state)} chat <- user said: {user_turn!r}")
 
     system = SystemMessage(
-        content=SYSTEM_PROMPT.format(preferences=json.dumps(state.get("preferences", {})))
+        content=SYSTEM_PROMPT.format(
+            preferences=json.dumps(state.get("preferences", {})),
+            known_locations=get_known_locations(),
+        )
     )
     t0 = time.monotonic()
     response = llm.invoke([system] + state["messages"])
@@ -407,11 +482,24 @@ def parse_intent(state: AppState) -> dict:
 
     # extract REPLY
     reply_match = re.search(r"REPLY:\s*(.+?)(?=PREF_UPDATE:|SEARCH:|FINALIZE:|$)", raw, re.DOTALL)
-    reply = reply_match.group(1).strip() if reply_match else raw.strip()
+    if reply_match:
+        reply = reply_match.group(1).strip()
+    else:
+        # No REPLY: prefix at all. Falling back to the whole raw output would
+        # read the PREF_UPDATE/SEARCH/FINALIZE lines aloud to the caller, so
+        # keep only the prose before the first tag.
+        reply = re.split(r"(?:PREF_UPDATE|SEARCH|FINALIZE)\s*:", raw)[0].strip()
+    # The model sometimes narrates its own tag bookkeeping inside REPLY --
+    # "(No PREF_UPDATE or SEARCH yet...)" -- which TTS would also read out.
+    reply = re.sub(r"\(\s*(?:No\s+)?(?:PREF_UPDATE|SEARCH|FINALIZE|REPLY)\b[^)]*\)", "", reply,
+                   flags=re.IGNORECASE)
+    reply = re.sub(r"\n\s*-{3,}\s*$", "", reply).strip()
 
     # extract PREF_UPDATE (tolerate a ```json fence, same as FINALIZE below --
     # without this, a fenced PREF_UPDATE silently drops the user's preferences)
-    pref_match = re.search(r"PREF_UPDATE:\s*(?:```(?:json)?\s*)?(\{.+?\})", raw, re.DOTALL)
+    # Tolerate one to three backticks -- a single-backtick `{...}` was silently
+    # dropping the customer's preferences.
+    pref_match = re.search(r"PREF_UPDATE:\s*(?:`{1,3}(?:json)?\s*)?(\{.+?\})", raw, re.DOTALL)
     preference_updates = {}
     if pref_match:
         try:
@@ -425,7 +513,7 @@ def parse_intent(state: AppState) -> dict:
 
     # extract FINALIZE (tolerate the model wrapping the JSON in a ```json fence
     # despite being told not to)
-    finalize_match = re.search(r"FINALIZE:\s*(?:```(?:json)?\s*)?(\{.+?\})", raw, re.DOTALL)
+    finalize_match = re.search(r"FINALIZE:\s*(?:`{1,3}(?:json)?\s*)?(\{.+?\})", raw, re.DOTALL)
     finalize_property = {}
     if finalize_match:
         try:
@@ -448,111 +536,273 @@ def parse_intent(state: AppState) -> dict:
     }
 
 
+def _clean_pref_value(col: str, value):
+    """Keep the typed columns typed. The model supplies these, and a stray
+    'semi furnished' or a bare string for amenities would abort the whole turn
+    on a Postgres type error, so anything unusable is dropped to NULL instead."""
+    if value is None:
+        return None
+    if col == "listingType":
+        v = str(value).strip().upper()
+        return v if v in LISTING_TYPES else None
+    if col == "furnishing":
+        v = str(value).strip().upper().replace(" ", "_").replace("-", "_")
+        v = {"FULLY_FURNISHED": "FURNISHED", "SEMIFURNISHED": "SEMI_FURNISHED"}.get(v, v)
+        return v if v in FURNISHINGS else None
+    if col == "amenities":
+        items = value if isinstance(value, list) else [value]
+        return [str(a).strip().lower() for a in items if str(a).strip()]
+    if col in ("bhk", "minArea", "maxArea", "minPrice", "maxPrice"):
+        try:
+            return int(value) if col == "bhk" else float(value)
+        except (TypeError, ValueError):
+            return None
+    return str(value).strip() or None
+
+
 def update_preferences(state: AppState) -> dict:
     updates = state.get("preference_updates", {})
-    if not updates:
+    # Only touch the columns the customer actually spoke to this turn. A
+    # COALESCE-everything form could never clear a preference: once a budget was
+    # set, "any budget, I don't care about price" left it in force forever and
+    # kept constraining every later search. Writing just the mentioned columns
+    # means a key sent as null is an explicit "forget this one", while anything
+    # unmentioned keeps its stored value.
+    touched = [c for c in PREF_COLUMNS if c in updates]
+    if not touched:
         return {}
-    phone = state["phone_number"]
+    updates = {c: _clean_pref_value(c, updates[c]) for c in touched}
+
+    cols = ", ".join(f'"{c}"' for c in touched)
+    placeholders = ", ".join(["%s"] * len(touched))
+    assignments = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in touched)
     with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO preferences (phone_number, bhk, min_amount, max_amount, area, other_pref, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (phone_number) DO UPDATE SET
-                bhk        = COALESCE(EXCLUDED.bhk,        preferences.bhk),
-                min_amount = COALESCE(EXCLUDED.min_amount, preferences.min_amount),
-                max_amount = COALESCE(EXCLUDED.max_amount, preferences.max_amount),
-                area       = COALESCE(EXCLUDED.area,       preferences.area),
-                other_pref = COALESCE(EXCLUDED.other_pref, preferences.other_pref),
-                updated_at = NOW()
-        """, (
-            phone,
-            updates.get("bhk"),
-            updates.get("min_amount"),
-            updates.get("max_amount"),
-            updates.get("area"),
-            updates.get("other_pref"),
-        ))
+        conn.execute(
+            f"""INSERT INTO {PREF_TABLE} (id, phone_number, {cols}, "updatedAt")
+                VALUES (%s, %s, {placeholders}, NOW())
+                ON CONFLICT (phone_number)
+                DO UPDATE SET {assignments}, "updatedAt" = NOW()""",
+            (str(uuid.uuid4()), state["phone_number"], *(updates[c] for c in touched)),
+        )
+
     merged = {**state.get("preferences", {}), **updates}
-    logger.info(f"{_ctx(state)} update_preferences applied {updates} -> merged={merged}")
+    cleared = [c for c in touched if updates[c] is None]
+    merged = {k: v for k, v in merged.items() if v not in (None, [])}
+    logger.info(f"{_ctx(state)} update_preferences applied {updates}"
+                f"{f' (cleared {cleared})' if cleared else ''} -> merged={merged}")
     return {"preferences": merged, "preference_updates": {}}
 
 
-def get_known_areas() -> list[str]:
+# Callers name regions, not just cities -- "anything in NCR" must widen to every
+# city in that region we actually stock, not fail as an unknown place name.
+REGIONS = {
+    "NCR": ["Delhi", "New Delhi", "Gurugram", "Gurgaon", "Noida", "Faridabad", "Ghaziabad", "Greater Noida"],
+    "MMR": ["Mumbai", "Navi Mumbai", "Thane", "Kalyan"],
+    "Tri-city": ["Chandigarh", "Mohali", "Panchkula"],
+}
+
+_locations_cache: "tuple[float, str] | None" = None
+
+
+def get_known_locations(ttl_sec: int = 300) -> str:
+    """Cached wrapper -- this is read on every turn by both `chat` and
+    `nl_to_sql`, and on a live call an extra DB round trip per turn is latency
+    the caller hears as silence. Inventory locations change rarely."""
+    global _locations_cache
+    now = time.monotonic()
+    if _locations_cache and now - _locations_cache[0] < ttl_sec:
+        return _locations_cache[1]
+    locations = _fetch_known_locations()
+    _locations_cache = (now, locations)
+    return locations
+
+
+def _fetch_known_locations() -> str:
+    """Real places from "Property", as "City: locality, locality" lines.
+
+    Location used to be one free-text `area` column; it's now city + locality,
+    and a caller may name either. Grouped rather than listed flat so the model
+    can't paste a combined "Mumbai / Worli" string in as a column value."""
     with get_conn() as conn:
-        rows = conn.execute("SELECT DISTINCT area FROM listings").fetchall()
-    return [r["area"] for r in rows]
+        rows = conn.execute(
+            'SELECT city, string_agg(DISTINCT locality, \', \') AS localities '
+            'FROM "Property" GROUP BY city ORDER BY city'
+        ).fetchall()
+    listing = "\n    ".join(f"{r['city']}: {r['localities'] or '-'}" for r in rows)
+
+    # Only advertise the region cities we hold inventory in, so a region search
+    # can never widen onto a city that isn't in the table.
+    stocked = {r["city"] for r in rows}
+    hints = [
+        f"{region} covers {', '.join(present)}"
+        for region, cities in REGIONS.items()
+        if (present := [c for c in cities if c in stocked])
+    ]
+    return listing + ("\n    Regions: " + "; ".join(hints) if hints else "")
+
+
+_SALE_WORDS = re.compile(r"\b(buy|buying|purchase|purchasing|own|owning|resale|for\s+sale|lakhs?|crores?)\b", re.I)
+_RENT_WORDS = re.compile(r"\b(rent|rental|renting|lease|leasing|tenant|monthly|per\s+month)\b", re.I)
+
+RENT_BUDGET_CEILING = 500_000    # a monthly rent above this is really a sale price
+SALE_BUDGET_FLOOR   = 1_000_000  # a purchase price below this is really a rent figure
+
+
+def _drop_mismatched_budget(search_query: str, prefs: dict, state: AppState) -> dict:
+    """A saved budget records no sense of whether it was given while renting or
+    buying -- preferences keeps one min/max pair for both. So when a caller
+    pivots ("2bhk under 30000" then "buy a 4bhk in Mumbai"), the rent figure
+    reaches the sale query as "saleAmount" <= 30000 and matches nothing. The
+    prompt asks the model to ignore such budgets and it doesn't reliably, so
+    the mismatch is settled here, like the visit-time hints below."""
+    is_sale = bool(_SALE_WORDS.search(search_query)) and not _RENT_WORDS.search(search_query)
+    cleaned = dict(prefs)
+    for key in ("minPrice", "maxPrice"):
+        amount = cleaned.get(key)
+        if amount is None:
+            continue
+        if (amount >= SALE_BUDGET_FLOOR) if is_sale else (amount <= RENT_BUDGET_CEILING):
+            continue
+        cleaned.pop(key)
+        logger.info(f"{_ctx(state)} nl_to_sql: dropped saved {key}={amount}, it can't be a "
+                    f"{'purchase price' if is_sale else 'monthly rent'} for {search_query!r}")
+    return cleaned
 
 
 def nl_to_sql(state: AppState) -> dict:
     """LLM converts natural language + preferences to SQL."""
-    prefs = state.get("preferences", {})
-    known_areas = get_known_areas()
+    prefs = _drop_mismatched_budget(state.get("search_query", ""), state.get("preferences", {}), state)
+    known_locations = get_known_locations()
 
     prompt = """Convert a property search request into a PostgreSQL SELECT query.
-    Valid area values that exist in the database (use ONLY these — nothing else):
-    {known_areas}
+    Real places in the database, as "City: its localities" (use ONLY these — never invent one):
+    {known_locations}
+    city and locality are two SEPARATE columns holding those plain names, so Worli is
+    city = 'Mumbai' AND locality = 'Worli'. Never put a combined "Mumbai / Worli" anywhere.
 
-    Table schema:
-    listings(id, area VARCHAR, bhk INT, rent INT)
+    Table schema — the table and its camelCase columns are quoted identifiers, so they
+    MUST keep the double quotes shown here or PostgreSQL lowercases them and the query fails:
+
+    "Property"(id TEXT, title TEXT, "listingType" ListingType, city TEXT, locality TEXT,
+               "areaSqft" FLOAT, bhk INT, "rentAmount" FLOAT, "saleAmount" FLOAT,
+               furnishing FurnishingStatus, "parkingSpots" INT, amenities TEXT[],
+               "isAvailable" BOOLEAN)
+      "listingType" is 'RENT' or 'SALE'.
+      "rentAmount" is set only on RENT rows, "saleAmount" only on SALE rows.
+      furnishing is 'UNFURNISHED', 'SEMI_FURNISHED' or 'FURNISHED'.
+      "areaSqft" is floor size, NOT a location.
 
     Search request: "{search_query}"
     User preferences (use as defaults for any missing field): {preferences}
+    Preference keys: city, locality, listingType ('RENT'/'SALE'), bhk, minPrice / maxPrice
+    (budget), minArea / maxArea (sqft), amenities (list), furnishing, otherPreference.
+    A stored listingType decides step 1 unless this request clearly says otherwise.
 
     Think through this silently before answering — do not show your reasoning in the output:
-    1. Did the user or preferences mention BHK? If yes, add "bhk = <number>". If no, skip it entirely.
-    2. Did the user or preferences mention rent/budget? If yes, add a rent condition using the actual numbers (BETWEEN, <=, or >=). If no, skip it entirely.
-    3. Did the user or preferences mention a specific area name? If yes, add "area ILIKE '%<name>%'". If no area was named, skip it entirely — do not restrict to any area.
-    4. Combine only the conditions that apply with AND. If none apply, return "SELECT * FROM listings;".
+    1. Renting or buying? "buy", "purchase", "price", "lakh", "crore" mean SALE; anything else
+       defaults to RENT. Pick exactly ONE and write it as a single equality — omitting it mixes
+       crore-priced sale flats into a rent search, and writing
+       "listingType" = 'RENT' OR "listingType" = 'SALE' is worse still: AND binds tighter than
+       OR, so that unparenthesized OR discards every other condition and returns the whole table.
+    2. Did the user or preferences mention BHK? If yes, add "bhk = <number>". If no, skip it entirely.
+    3. Did the user or preferences mention a budget? Put it on "rentAmount" for a RENT search or
+       "saleAmount" for a SALE search — never the wrong one, and never rescale the number the
+       customer gave. If no budget, skip it entirely. Ignore a saved budget whose size clearly
+       belongs to the other mode (a 40000 budget is rent, not a purchase price).
+    4. Did the user or preferences name a place? Match both columns, since a caller may say either:
+       (city ILIKE '%<name>%' OR locality ILIKE '%<name>%'). If no place was named, skip it
+       entirely — do not restrict to any location.
+       A REGION (NCR, Delhi NCR, MMR, tri-city) is not a city — expand it to every city the
+       Regions line above says it covers, OR'd together, e.g. for NCR:
+       (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%')
+       Older city names mean the modern one in the list: Bombay is Mumbai, Bangalore is
+       Bengaluru, Calcutta is Kolkata, Madras is Chennai, Gurgaon is Gurugram. Match the
+       name as it appears in the list above, never the name the caller happened to use.
+
+    4b. Did they ask for the cheapest / most expensive / biggest / smallest? That is an
+        ORDER BY, not a filter: add ORDER BY "rentAmount" ASC (or "saleAmount", or "areaSqft"
+        DESC for biggest) and LIMIT 3. Never answer a superlative by filtering on a guessed
+        price. "cheapest" sorts ascending; "most expensive"/"biggest" sorts descending.
+    5. An amenity? amenities is an array, so use '<amenity>' = ANY(amenities), never ILIKE.
+       Furnishing uses the enum; parking uses "parkingSpots" > 0.
+    6. ALWAYS add "isAvailable" = TRUE — an unavailable property must never reach a caller.
+    7. Combine only the conditions that apply with AND.
 
     ═══ FEW-SHOT EXAMPLES ═══
 
     Search request: "2bhk around 30k"
     Preferences: {{}}
-    SQL: SELECT * FROM listings WHERE bhk = 2 AND rent BETWEEN 25000 AND 35000;
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND "rentAmount" BETWEEN 25000 AND 35000 AND "isAvailable" = TRUE;
 
-    Search request: "show me flats around 25k"
+    Search request: "3bhk in Whitefield under 60000"
     Preferences: {{}}
-    SQL: SELECT * FROM listings WHERE rent BETWEEN 20000 AND 30000;
-
-    Search request: "3bhk in sector 45 under 1 lakh"
-    Preferences: {{}}
-    SQL: SELECT * FROM listings WHERE bhk = 3 AND area ILIKE '%sector 45%' AND rent <= 100000;
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 3 AND (city ILIKE '%Whitefield%' OR locality ILIKE '%Whitefield%') AND "rentAmount" <= 60000 AND "isAvailable" = TRUE;
 
     Search request: "any flat in budget 20k"
-    Preferences: {{"preferred_bhk": [2], "preferred_areas": ["Sector 62"]}}
-    SQL: SELECT * FROM listings WHERE bhk = 2 AND area ILIKE '%Sector 62%' AND rent <= 20000;
+    Preferences: {{"bhk": 2, "locality": "Kondapur"}}
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND (city ILIKE '%Kondapur%' OR locality ILIKE '%Kondapur%') AND "rentAmount" <= 20000 AND "isAvailable" = TRUE;
+
+    Search request: "i want to buy a 4bhk in Mumbai under 5 crore"
+    Preferences: {{}}
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'SALE' AND bhk = 4 AND (city ILIKE '%Mumbai%' OR locality ILIKE '%Mumbai%') AND "saleAmount" <= 50000000 AND "isAvailable" = TRUE;
+
+    Search request: "a furnished place with a gym in Pune"
+    Preferences: {{}}
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND (city ILIKE '%Pune%' OR locality ILIKE '%Pune%') AND furnishing = 'FURNISHED' AND 'gym' = ANY(amenities) AND "isAvailable" = TRUE;
 
     Search request: "something above 15k"
     Preferences: {{}}
-    SQL: SELECT * FROM listings WHERE rent >= 15000;
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND "rentAmount" >= 15000 AND "isAvailable" = TRUE;
 
-    Search request: "show me some options"
-    Preferences: {{"preferred_bhk": [3], "budget_max": 50000}}
-    SQL: SELECT * FROM listings WHERE bhk = 3 AND rent <= 50000;
-
-    Search request: "flats near 30k, any area is fine"
+    Search request: "cheapest 2bhk options in NCR"
     Preferences: {{}}
-    SQL: SELECT * FROM listings WHERE rent BETWEEN 25000 AND 35000;
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%') AND "isAvailable" = TRUE ORDER BY "rentAmount" ASC LIMIT 3;
+
+    Search request: "the most expensive place you have to buy"
+    Preferences: {{}}
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'SALE' AND "isAvailable" = TRUE ORDER BY "saleAmount" DESC LIMIT 3;
+
+    Search request: "flats in Bombay"
+    Preferences: {{}}
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND (city ILIKE '%Mumbai%' OR locality ILIKE '%Mumbai%') AND "isAvailable" = TRUE;
+
+    Search request: "just show me whatever you have"
+    Preferences: {{"bhk": 3, "maxPrice": 50000}}
+    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 3 AND "rentAmount" <= 50000 AND "isAvailable" = TRUE;
 
     ═══ CRITICAL OUTPUT RULES ═══
 
     - Output ONLY a complete, valid, executable PostgreSQL query — nothing else.
     - NEVER output placeholder text like [extracted_bhk_value], <number>, [no_area_filter], or any bracketed/templated text. Every value in your output must be a real number or string, never a placeholder.
     - NEVER output comments (-- ...) inside the SQL.
-    - NEVER include OR conditions like "(rent <= X OR [no_rent_filter])" — either include the real condition or omit it entirely. There is no such thing as a conditional clause in the output; you decide before writing, then write only what applies.
+    - NEVER include OR conditions like "("rentAmount" <= X OR [no_rent_filter])" — either include the real condition or omit it entirely. There is no such thing as a conditional clause in the output; you decide before writing, then write only what applies.
     - No backticks, no markdown, no explanation, no reasoning shown — just the raw SQL statement ending in a semicolon.
-    - Only use columns: id, area, bhk, rent — nothing else exists in this table.
+    - Only use the columns listed above — there is no `area` column and no `rent` column.
     - "around X" / "near X" means a ±5000 range around X for rent, unless the user gives an explicit min/max or "under/above X".
+    - Spoken Indian amounts are digits: "25k" → 25000, "50 lakh" → 5000000, "1 crore" → 10000000.
+    - Take every value from THIS request's search/preferences lines — the examples teach the SQL
+      shape only, so never copy a bhk, budget or place out of one.
+
+    - EVERY OR must sit inside its own parentheses, because AND binds tighter than OR.
+      Right: (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%') AND bhk = 3
+      Wrong: city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%' AND bhk = 3
+      The wrong form quietly means "every Delhi row, plus Gurugram 3BHKs" — the bhk filter
+      is lost. If you cannot express something as one parenthesised group, leave it out.
 
     ═══ WRONG OUTPUT (never do this) ═══
-    SELECT * FROM listings WHERE (bhk = [extracted_bhk_value] OR [no_bhk_filter]) AND ...
-    ↑ This is wrong. Placeholders and OR-skip patterns must never appear in output.
+    SELECT * FROM listings WHERE (bhk = [extracted_bhk_value] OR [no_bhk_filter]) AND area ILIKE '%x%';
+    ↑ Wrong three times over: the table is "Property", there are no `area`/`rent` columns, and
+      placeholders and OR-skip patterns must never appear in output.
+
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' OR "listingType" = 'SALE' AND bhk = 3 AND "isAvailable" = TRUE;
+    ↑ Wrong: this returns every RENT row in the table, ignoring bhk and availability entirely.
+      Choose one listing type: "listingType" = 'RENT' AND bhk = 3 AND "isAvailable" = TRUE.
     """
     # schema = get_schema()   # use this to get the real schema from the DB
     prompt = prompt.format(
         search_query=state['search_query'],
         preferences=json.dumps(prefs),
-        known_areas=known_areas,
+        known_locations=known_locations,
     )
     t0 = time.monotonic()
     response = llm.invoke([HumanMessage(content=prompt)])
@@ -563,7 +813,7 @@ def nl_to_sql(state: AppState) -> dict:
     if not sql.upper().startswith("SELECT"):
         import re
         match = re.search(r"(SELECT.+?;)", sql, re.DOTALL | re.IGNORECASE)
-        sql = match.group(1) if match else "SELECT * FROM listings WHERE available = TRUE LIMIT 5;"
+        sql = match.group(1) if match else 'SELECT * FROM "Property" WHERE "isAvailable" = TRUE LIMIT 5;'
 
     logger.info(f"{_ctx(state)} nl_to_sql ({elapsed:.2f}s) search_query={state['search_query']!r} -> {sql}")
 
@@ -579,14 +829,65 @@ def query_listings(state: AppState) -> dict:
         with get_conn() as conn:
             rows = conn.execute(sql).fetchall()
         elapsed = time.monotonic() - t0
-        logger.info(f"{_ctx(state)} query_listings ran in {elapsed:.2f}s -> {len(rows)} row(s)")
-        return {"search_results": [dict(r) for r in rows]}
+        # An OR-heavy generated WHERE can match the same property twice; the
+        # caller would hear it read out as two separate options.
+        unique = list({r["id"]: dict(r) for r in rows}.values())
+        if len(unique) != len(rows):
+            logger.info(f"{_ctx(state)} query_listings dropped {len(rows) - len(unique)} duplicate row(s)")
+        logger.info(f"{_ctx(state)} query_listings ran in {elapsed:.2f}s -> {len(unique)} row(s)")
+        return {"search_results": unique}
     except Exception:
         logger.exception(f"{_ctx(state)} query_listings SQL error while running: {sql!r}")
         return {"search_results": []}
 
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+
+_ONES = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+         "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+         "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _under_thousand(n: int) -> str:
+    out = []
+    if n >= 100:
+        out.append(f"{_ONES[n // 100]} hundred")
+        n %= 100
+    if n >= 20:
+        out.append(_TENS[n // 10] + (f" {_ONES[n % 10]}" if n % 10 else ""))
+    elif n:
+        out.append(_ONES[n])
+    return " ".join(out)
+
+
+def spell_amount(n: int) -> str:
+    """Indian-numbering words for a rupee figure: 4800000 -> "forty eight lakh".
+    TTS reads bare digits as a digit string ("two five zero zero zero"), and the
+    model still emits "25,000" on turns that skip format_reply, so the digits
+    are converted here rather than relying on the prompt alone."""
+    if n == 0:
+        return "zero"
+    parts = []
+    for div, name in ((10_000_000, "crore"), (100_000, "lakh"), (1_000, "thousand")):
+        if n >= div:
+            q, n = divmod(n, div)
+            parts.append(f"{_under_thousand(q)} {name}")
+    if n:
+        parts.append(_under_thousand(n))
+    return " ".join(parts)
+
+
+def _price(r: dict) -> str:
+    """A row carries "rentAmount" or "saleAmount" depending on "listingType",
+    never both, so pick whichever is set."""
+    if r.get("rentAmount"):
+        return f"{spell_amount(int(r['rentAmount']))} rupees per month"
+    if r.get("saleAmount"):
+        return f"{spell_amount(int(r['saleAmount']))} rupees to buy"
+    return "price on request"
+
 
 def format_reply(state: AppState) -> dict:
     last_id = state["messages"][-1].id
@@ -613,8 +914,8 @@ def format_reply(state: AppState) -> dict:
 
     if results:
         listings_text = "\n".join(
-            f"- {r.get('locality', 'Unknown')}, {r.get('bhk', '')}BHK, "
-            f"₹{r.get('rent', 'N/A')}/mo, {r.get('amenities', '')}"
+            f"- {r.get('title', '')}, {r.get('locality') or r.get('city', 'Unknown')}, "
+            f"{r.get('bhk', '')}BHK, {_price(r)}, {', '.join(r.get('amenities') or [])}"
             for r in results
         )
     else:
@@ -625,6 +926,8 @@ def format_reply(state: AppState) -> dict:
 
     Rules:
     - Spell out numbers the way a person would say them aloud. "30000" becomes "thirty thousand rupees", never "3-0-0-0-0" or "30,000".
+    - Use Indian numbering, the way an Indian speaker would: 5000000 is "fifty lakh", 10000000 is "one crore", 48000000 is "four crore eighty lakh". Never say "million" or "billion".
+    - Each result is either to rent or to buy. Say "per month" for a rent figure and just the price for a purchase -- never call a sale price monthly rent.
     - Never use digits, commas, currency symbols, or abbreviations. No ₹. Say "per month", not "/mo".
     - Keep it conversational and concise: like someone speaking on a phone call.
     - Do not fabricate the results or hallucinate on making your own answers, Only truth is the Search results you will get
@@ -1233,7 +1536,7 @@ def run():
             if user_input.lower() == "prefs":
                 with get_conn() as conn:
                     row = conn.execute(
-                        "SELECT bhk, min_amount, max_amount, area, other_pref FROM preferences WHERE phone_number = %s",
+                        f"SELECT {', '.join(chr(34)+c+chr(34) for c in PREF_COLUMNS)} FROM {PREF_TABLE} WHERE phone_number = %s",
                         (phone,)
                     ).fetchone()
                 print(f"\nSaved preferences: {dict(row) if row else 'none yet'}")
