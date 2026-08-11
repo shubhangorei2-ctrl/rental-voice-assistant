@@ -27,6 +27,7 @@ from psycopg.rows import dict_row
 # handlers/format configured there apply to this module's logger too)
 from property_agent import (
     AppState,
+    spell_amount,
     load_preferences,
     chat,
     parse_intent,
@@ -143,13 +144,25 @@ builder.add_edge("booking_flow",       END)
 active_calls: dict = {}
 
 
+# 4+ digit runs, or comma-grouped figures -- but never something glued to a
+# letter, so "2BHK" and "3BHK" survive untouched.
+_AMOUNT_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{2,3})+|\d{4,})(?!\.?\d)(?![A-Za-z])")
+
+
 def clean_for_voice(reply: str) -> str:
     reply = re.sub(r"\*+", "", reply)
     reply = re.sub(r"#+\s*", "", reply)
+    # Markdown list markers read aloud as "dash" / "one dot"; strip them before
+    # newlines become sentence breaks below.
+    reply = re.sub(r"^\s*(?:[-•]|\d+\.)\s+", "", reply, flags=re.MULTILINE)
     reply = re.sub(r"\n+", ". ", reply)
     reply = re.sub(r"₹", "rupees ", reply)
-    reply = re.sub(r"/mo", "per month", reply)
-    return reply
+    # "/month" must not be rewritten by the "/mo" rule -- that produced
+    # "per monthnth" in live replies. Longest form first, then bare "/mo".
+    reply = re.sub(r"/month\b", " per month", reply, flags=re.IGNORECASE)
+    reply = re.sub(r"/mo\b", " per month", reply, flags=re.IGNORECASE)
+    reply = _AMOUNT_RE.sub(lambda m: spell_amount(int(m.group(1).replace(",", ""))), reply)
+    return re.sub(r"\s{2,}", " ", reply).strip()
 
 
 def get_or_create_call(call_id: str, phone_number: str) -> dict:
