@@ -150,13 +150,13 @@ def _get_pool() -> ConnectionPool:
             if _pool is None:
                 _pool = ConnectionPool(
                     conninfo=DB_URI,
-                    min_size=2,
-                    max_size=20,
+                    min_size=1,
+                    max_size=6,
                     kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
                     check=ConnectionPool.check_connection,
                     open=True,
                 )
-                logger.info("DB pool opened (min=2 max=20)")
+                logger.info("DB pool opened (min=1 max=6)")
     return _pool
 
 
@@ -401,7 +401,7 @@ STEP 5 — Has the user just finalized / decided on ONE specific property from t
   - "thanks", "bye", "exit", "okay great" or any conversation-closing message → No, NEVER emit FINALIZE on a goodbye/closing turn
   - A visit was already booked for this property earlier in this conversation → No, never re-finalize a property that's already booked
 
-  If yes → include a FINALIZE tag: a JSON object with whatever fields of that specific property you can identify from what was already shown in this conversation (area, bhk, rent, amenities). Only include fields you actually know from the conversation; omit fields you don't. Also make REPLY gently and naturally ask for the customer's email address so their property details and a visit invite can be sent over.
+  If yes → include a FINALIZE tag: a JSON object with whatever fields of that specific property you can identify from what was already shown in this conversation (area, bhk, rent, amenities). Only include fields you actually know from the conversation; omit fields you don't. Also make REPLY ask for the customer's email address so their details and a visit invite can be sent over, and ask them to SPELL IT OUT letter by letter, saying the domain (like gmail dot com) normally. A spoken email is the noisiest thing on a call and transcribes far more reliably when spelled, so this instruction must be in your REPLY -- do not just say "could you share your email". Ask for the email only; do not ask for the visit date in the same breath.
   If no → skip FINALIZE entirely.
 
 ═══ NOW RESPOND IN THIS EXACT FORMAT ═══
@@ -535,6 +535,13 @@ def chat(state: AppState) -> dict:
     return {"messages": [response]}
 
 
+_ASKS_FOR_EMAIL_RE = re.compile(
+    r"(?:share|spell|give|provide|send me|have)\b[^.?!]{0,50}\bemail\b"
+    r"|\byour email\s*(?:address|id)?\b",
+    re.IGNORECASE,
+)
+
+
 def parse_intent(state: AppState) -> dict:
     raw = state["messages"][-1].content
 
@@ -578,6 +585,18 @@ def parse_intent(state: AppState) -> dict:
             finalize_property = json.loads(finalize_match.group(1))
         except json.JSONDecodeError:
             logger.warning(f"{_ctx(state)} parse_intent: FINALIZE block wasn't valid JSON, ignoring: {finalize_match.group(1)!r}")
+
+    # The model sometimes writes the email request into REPLY but forgets the
+    # FINALIZE tag, so booking_stage stays empty and the caller's next utterance
+    # -- their actual email -- is handled as ordinary chat and thrown away. They
+    # then get asked for it a second time. Observed on a live call. If the reply
+    # asks for an email, start the booking regardless of the missing tag.
+    if (not finalize_property
+            and not state.get("booking_stage")
+            and _ASKS_FOR_EMAIL_RE.search(reply)):
+        logger.warning(f"{_ctx(state)} parse_intent: REPLY asks for an email but no FINALIZE tag "
+                       f"was emitted; starting the booking anyway so the answer isn't lost")
+        finalize_property = {"from_reply": True}
 
     logger.info(
         f"{_ctx(state)} parse_intent -> reply={reply[:80]!r}{'...' if len(reply) > 80 else ''} "
@@ -733,9 +752,8 @@ def _drop_mismatched_budget(search_query: str, prefs: dict, state: AppState) -> 
     return cleaned
 
 
-def _budget_in_prefs(state: AppState) -> bool:
-    prefs = state.get("preferences") or {}
-    return any(prefs.get(k) is not None for k in ("minPrice", "maxPrice"))
+def _budget_in_prefs(prefs: dict) -> bool:
+    return any((prefs or {}).get(k) is not None for k in ("minPrice", "maxPrice"))
 
 
 # "3bhk" contains a digit but names no budget, so bhk tokens are removed before
@@ -755,7 +773,7 @@ def _budget_stated(text: str) -> bool:
     return bool(_BUDGET_HINT_RE.search(_BHK_TOKEN_RE.sub(" ", text or "")))
 
 
-def _enforce_sql_guards(sql: str, search_query: str, state: AppState) -> str:
+def _enforce_sql_guards(sql: str, search_query: str, state: AppState, prefs: dict) -> str:
     """Add back the two clauses that must never be missing, whichever model wrote
     the query. On a neutral request ("anything in Kakkanad") the model tends to
     drop "listingType" entirely, which silently mixes crore-priced sale flats
@@ -766,7 +784,7 @@ def _enforce_sql_guards(sql: str, search_query: str, state: AppState) -> str:
     # nothing, so the caller is told there is no inventory when there is. If
     # neither the request nor the stored preferences carry a figure, no price
     # comparison belongs in the query.
-    if not _budget_stated(search_query) and not _budget_in_prefs(state):
+    if not _budget_stated(search_query) and not _budget_in_prefs(prefs):
         stripped = re.sub(
             r'\s*AND\s*"(?:rent|sale)Amount"\s*(?:<=|>=|<|>|=)\s*\d+(?:\.\d+)?'
             r'|\s*AND\s*"(?:rent|sale)Amount"\s+BETWEEN\s+\d+(?:\.\d+)?\s+AND\s+\d+(?:\.\d+)?',
@@ -903,7 +921,9 @@ def nl_to_sql(state: AppState) -> dict:
         match = re.search(r"(SELECT.+?;)", sql, re.DOTALL | re.IGNORECASE)
         sql = match.group(1) if match else 'SELECT * FROM "Property" WHERE "isAvailable" = TRUE LIMIT 5;'
 
-    sql = _enforce_sql_guards(sql, state.get("search_query", ""), state)
+    # `prefs` here is the sanitised set: a rent budget already dropped for a sale
+    # search must not then justify keeping an invented one.
+    sql = _enforce_sql_guards(sql, state.get("search_query", ""), state, prefs)
 
     logger.info(f"{_ctx(state)} nl_to_sql ({elapsed:.2f}s) search_query={state['search_query']!r} -> {sql}")
 
@@ -1144,26 +1164,86 @@ def _llm_extract_email(text: str, state: AppState) -> str:
     return ""
 
 
-_SPELLED_OUT_RE = re.compile(r"(?:\b\w\b\s+){2,}\b\w\b")
+# Single characters separated by spaces OR the hyphens/dots that speech-to-text
+# inserts when a caller spells: "S-H-U-B-H-A-N-G-O-R. E. I". The space-only form
+# missed the hyphenated one, and the molding heuristic then produced
+# "S-H-U-B-H-A-N-G-O-R.E.I@gmail.com" -- spoken back to the caller as garbage.
+_SPELLED_OUT_RE = re.compile(r"(?:\b\w\b[\s.\-]+){2,}\b\w\b")
+
+# Strict shape for an address we are willing to send mail to.
+_EMAIL_STRICT_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._%+-]*[a-z0-9])?@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z]{2,})+$"
+)
+
+# Words that mean "this address is wrong" -- checked before any attempt to read a
+# new address out of the same sentence.
+_EMAIL_REJECT_RE = re.compile(
+    r"\b(?:not|isn'?t|ain'?t)\s+(?:correct|right|it|quite\s+right)\b"
+    r"|\b(?:in)?correct(?:ly)?\b|\bwrong\b|\bmistake\b|\btypo\b|\bmisspell\w*\b"
+    r"|\bthat'?s\s+not\b|\bnope\b",
+    re.IGNORECASE,
+)
 
 
 def _looks_spelled_out(text: str) -> bool:
-    """Detects a run of 3+ single-character tokens ('s h u b h a n g at gmail').
-    The regex/molding heuristic below silently mangles these -- it grabs only
-    the last spelled-out letter as the local-part -- so this pattern is
-    checked first and routed straight to the LLM fallback instead."""
+    """A run of 3+ single-character tokens, however STT chose to separate them."""
     return bool(_SPELLED_OUT_RE.search(text))
 
 
+def _mentions_an_address(text: str) -> bool:
+    """Is the caller plausibly giving an address at all? Without this check the
+    LLM fallback is handed sentences like "but the email is not correct" and
+    happily invents a well-formed address that was never said."""
+    if "@" in text or _looks_spelled_out(text):
+        return True
+    return bool(re.search(r"\b(at the rate|at|dot|gmail|yahoo|outlook|hotmail|icloud|rediff|proton)\b",
+                          text, re.IGNORECASE))
+
+
+def _supported_by_text(email: str, text: str) -> bool:
+    """Every character of the address must appear, in order, in what the caller
+    actually said. Speech gives us the letters one way or another -- spelled,
+    run together, or with "dot"/"at" spoken -- so a genuine address always
+    survives this, while an invented one ("shubhang.singh@domain.com" from a
+    sentence containing no such letters) cannot."""
+    needle = re.sub(r"[^a-z0-9]", "", email.lower())
+    hay = re.sub(r"[^a-z0-9]", "", text.lower())
+    pos = 0
+    for ch in needle:
+        pos = hay.find(ch, pos)
+        if pos < 0:
+            return False
+        pos += 1
+    return True
+
+
+def _accept_email(candidate: str, text: str, state: AppState, how: str) -> str:
+    """Normalise, then refuse anything malformed or unsupported by the caller."""
+    email = (candidate or "").strip().strip(".,;:").lower()
+    if not email or not _EMAIL_STRICT_RE.match(email):
+        logger.warning(f"{_ctx(state)} extract_email: rejected {candidate!r} from {how} (bad shape)")
+        return ""
+    if not _supported_by_text(email, text):
+        logger.warning(f"{_ctx(state)} extract_email: rejected {email!r} from {how} -- "
+                       f"its characters are not in what the caller said ({text!r})")
+        return ""
+    return email
+
+
 def extract_email(text: str, state: AppState = None) -> str:
+    if not _mentions_an_address(text):
+        return ""
+
     if state is not None and _looks_spelled_out(text):
-        return _llm_extract_email(text, state)
+        return _accept_email(_llm_extract_email(text, state), text, state, "llm/spelled")
 
     match = _EMAIL_RE.search(text) or _EMAIL_RE.search(_mold_spoken_email(text))
     if match:
-        return match.group(0)
+        got = _accept_email(match.group(0), text, state or {}, "regex")
+        if got:
+            return got
     if state is not None:
-        return _llm_extract_email(text, state)
+        return _accept_email(_llm_extract_email(text, state), text, state, "llm")
     return ""
 
 
@@ -1300,6 +1380,15 @@ def normalize_visit_datetime(text: str, state: AppState) -> str:
     return candidate
 
 
+def _spoken_when(dt: "datetime") -> str:
+    """A visit time as a person would say it. The four-digit year used to reach
+    clean_for_voice, which spells any 4+ digit run as a rupee figure -- the
+    caller heard "Saturday, 15 August two thousand twenty six at 06:00 PM"."""
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    minutes = "" if dt.minute == 0 else f" {dt.strftime('%M')}"
+    return f"{dt.strftime('%A')}, {dt.day} {dt.strftime('%B')} at {hour}{minutes} {dt.strftime('%p')}"
+
+
 def _build_ics(prop: dict, customer_email: str, visit_dt: "datetime") -> str:
     """Hand-built single-VEVENT iCalendar invite (METHOD:REQUEST) so mail
     clients render it as an RSVP the customer can accept/decline and add to
@@ -1433,6 +1522,21 @@ def booking_flow(state: AppState) -> dict:
                      "letter? You can say the domain, like gmail dot com, normally.")
             return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_email"}
 
+        # If the visit time is already settled -- the usual case when the caller
+        # is correcting a mis-heard address -- don't make them say it twice.
+        already = state.get("visit_datetime_iso")
+        if already:
+            when_text = _spoken_when(datetime.fromisoformat(already))
+            logger.info(f"{_ctx(state)} booking_flow: got corrected email {email}, "
+                        f"visit time already known -> straight to confirmation")
+            reply = (f"Got it, {email}. So that's a visit to {describe_property(pending)} on "
+                     f"{when_text}. Shall I send the details there?")
+            return {
+                "messages"      : [AIMessage(content=reply)],
+                "booking_stage" : "awaiting_confirmation",
+                "customer_email": email,
+            }
+
         logger.info(f"{_ctx(state)} booking_flow: got email {email}, asking for visit time")
         reply = (
             f"Got it, {email}. And when would you be comfortable visiting "
@@ -1450,7 +1554,7 @@ def booking_flow(state: AppState) -> dict:
             reply = "Sorry, I didn't catch a clear date and time -- could you tell me again, like 'this Saturday at 4pm'?"
             return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_visit_time"}
 
-        when_text = datetime.fromisoformat(iso_text).strftime("%A, %d %B %Y at %I:%M %p")
+        when_text = _spoken_when(datetime.fromisoformat(iso_text))
         reply = (
             f"Just to confirm -- I'll send the details for {describe_property(pending)} to "
             f"{state.get('customer_email', '')} for a visit on {when_text}. Shall I go ahead and send that?"
@@ -1462,11 +1566,23 @@ def booking_flow(state: AppState) -> dict:
         }
 
     if stage == "awaiting_confirmation":
+        # "Yeah sure, but the email is not correct" contains an affirmation AND a
+        # rejection. The complaint has to win, and it has to be tested BEFORE we
+        # try to read a new address out of the same sentence -- otherwise the
+        # sentence gets mined for an address it never contained.
+        if _EMAIL_REJECT_RE.search(user_msg):
+            logger.info(f"{_ctx(state)} booking_flow: customer says the address is wrong "
+                        f"({user_msg!r}) -> back to awaiting_email")
+            reply = ("No problem, let's fix that. Could you spell your email out for me letter "
+                     "by letter? Say the domain, like gmail dot com, normally.")
+            return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_email",
+                    "customer_email": ""}
+
         # The customer is correcting the email right here instead of answering
         # yes/no -- update it and ask for confirmation again with the new address.
         corrected_email = extract_email(user_msg, state)
         if corrected_email and corrected_email != state.get("customer_email", ""):
-            when_text = datetime.fromisoformat(state.get("visit_datetime_iso")).strftime("%A, %d %B %Y at %I:%M %p")
+            when_text = _spoken_when(datetime.fromisoformat(state.get("visit_datetime_iso")))
             reply = f"Got it, updated to {corrected_email}. Shall I go ahead and send the visit details there for {when_text}?"
             return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_confirmation", "customer_email": corrected_email}
 
@@ -1474,10 +1590,11 @@ def booking_flow(state: AppState) -> dict:
             logger.info(f"{_ctx(state)} booking_flow: customer said the details were wrong, re-asking for email")
             reply = ("No problem -- could you spell out the correct email, letter by letter? "
                      "You can say the domain, like gmail dot com, normally.")
-            return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_email"}
+            return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_email",
+                    "customer_email": ""}
 
         if not _AFFIRM_RE.search(user_msg):
-            when_text = datetime.fromisoformat(state.get("visit_datetime_iso")).strftime("%A, %d %B %Y at %I:%M %p")
+            when_text = _spoken_when(datetime.fromisoformat(state.get("visit_datetime_iso")))
             reply = f"Just to confirm -- should I send the visit details to {state.get('customer_email', '')} for {when_text}?"
             return {"messages": [AIMessage(content=reply)], "booking_stage": "awaiting_confirmation"}
 
@@ -1485,7 +1602,7 @@ def booking_flow(state: AppState) -> dict:
         customer_email = state.get("customer_email", "")
         sent = send_confirmation_email(pending, customer_email, visit_dt, state)
 
-        when_text = visit_dt.strftime("%A, %d %B %Y at %I:%M %p")
+        when_text = _spoken_when(visit_dt)
         if sent:
             reply = (
                 f"All set! I've sent the property details and a calendar invite to "
