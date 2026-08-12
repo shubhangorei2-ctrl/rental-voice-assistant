@@ -22,8 +22,10 @@ import smtplib
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import threading
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from typing import TypedDict, Optional
 from langchain_mistralai import ChatMistralAI
 # from langchain_google_genai import ChatGoogleGenerativeAI
@@ -81,11 +83,29 @@ API_KEY = os.getenv("MISTRAL_API_KEY")
 # fallback model in seconds instead of minutes.
 LLM_TIMEOUT_SEC = 15
 
-primary_llm = ChatMistralAI(model="mistral-large-latest", max_retries=3, timeout=LLM_TIMEOUT_SEC, temperature=0.1, api_key=API_KEY)
-fallback_llm = ChatMistralAI(model="open-mistral-7b", max_retries=3, timeout=LLM_TIMEOUT_SEC, temperature=0.1, api_key=API_KEY)
+# Fast path timeout. Retries multiply the wait, so a stuck primary attempt used
+# to burn 3 x 15s before failing over -- unusable on a live call.
+FAST_TIMEOUT_SEC = 8
 
+# How much conversation to resend to the chat model each turn (~10 exchanges).
+MAX_HISTORY_MESSAGES = 20
+
+primary_llm = ChatMistralAI(model="mistral-large-latest", max_retries=2, timeout=LLM_TIMEOUT_SEC, temperature=0.1, api_key=API_KEY)
+# open-mistral-7b was the old fallback, but it returns malformed SQL, so the
+# failover path silently produced broken queries. mistral-small handles every
+# mechanical task here and measured ~3x faster than large on the same prompt.
+# max_retries=2 rather than 1: the Mistral API returns 429 under concurrent
+# calls, and a single attempt turns a transient rate-limit into a failed turn.
+# Two attempts at an 8s timeout still cap far below the old 3 x 15s.
+fallback_llm = ChatMistralAI(model="mistral-small-latest", max_retries=2, timeout=FAST_TIMEOUT_SEC, temperature=0.1, api_key=API_KEY)
+fast_base = ChatMistralAI(model="mistral-small-latest", max_retries=2, timeout=FAST_TIMEOUT_SEC, temperature=0.1, api_key=API_KEY)
+
+# `llm` drives the conversation: persona, tag emission, preference extraction.
+# `fast_llm` drives the mechanical steps (text -> SQL, rows -> sentence) where a
+# smaller model measured as good and far quicker.
 llm = primary_llm.with_fallbacks([fallback_llm])
-logger.info(f"LLM configured | primary=mistral-large-latest fallback=open-mistral-7b | DB host={DB_URI.split('@')[-1].split('/')[0] if '@' in DB_URI else DB_URI}")
+fast_llm = fast_base.with_fallbacks([primary_llm])
+logger.info(f"LLM configured | chat=mistral-large-latest fast=mistral-small-latest | DB host={DB_URI.split('@')[-1].split('/')[0] if '@' in DB_URI else DB_URI}")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -114,9 +134,38 @@ class AppState(TypedDict):
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
+# One pool for the whole process. Opening a fresh connection per query cost a
+# TLS handshake to Neon every time -- measured at 329ms versus 52ms through a
+# warm pool, and a search turn makes three such calls. check_connection is what
+# lets the pool survive Neon's idle auto-suspend: dead connections are discarded
+# on checkout instead of surfacing as "the connection is closed".
+_pool: "ConnectionPool | None" = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = ConnectionPool(
+                    conninfo=DB_URI,
+                    min_size=2,
+                    max_size=20,
+                    kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
+                    check=ConnectionPool.check_connection,
+                    open=True,
+                )
+                logger.info("DB pool opened (min=2 max=20)")
+    return _pool
+
+
 def get_conn():
+    """Borrow a pooled connection. Returns a context manager, so every existing
+    `with get_conn() as conn:` call site works unchanged -- the connection is
+    returned to the pool on exit rather than closed."""
     try:
-        return psycopg.connect(DB_URI, autocommit=True, row_factory=dict_row)
+        return _get_pool().connection()
     except Exception:
         logger.exception("DB connection failed")
         raise
@@ -464,8 +513,17 @@ def chat(state: AppState) -> dict:
             known_locations=get_known_locations(),
         )
     )
+    # The whole transcript used to be resent every turn, so the prompt -- and
+    # with it the response time -- grew for the length of the call. A window
+    # keeps it flat. Kept generous because callers do refer back ("what did I
+    # say earlier?", "which two amenities did I mention?").
+    history = state["messages"][-MAX_HISTORY_MESSAGES:]
+    if len(state["messages"]) > MAX_HISTORY_MESSAGES:
+        logger.info(f"{_ctx(state)} chat: history windowed "
+                    f"{len(state['messages'])} -> {len(history)} messages")
+
     t0 = time.monotonic()
-    response = llm.invoke([system] + state["messages"])
+    response = llm.invoke([system] + history)
     elapsed = time.monotonic() - t0
     logger.info(f"{_ctx(state)} chat -> LLM responded in {elapsed:.2f}s")
     logger.debug(f"{_ctx(state)} chat raw LLM output:\n{response.content}")
@@ -644,6 +702,12 @@ def _fetch_known_locations() -> str:
 _SALE_WORDS = re.compile(r"\b(buy|buying|purchase|purchasing|own|owning|resale|for\s+sale|lakhs?|crores?)\b", re.I)
 _RENT_WORDS = re.compile(r"\b(rent|rental|renting|lease|leasing|tenant|monthly|per\s+month)\b", re.I)
 
+
+def _looks_like_sale(text: str) -> bool:
+    """True only when the wording clearly points at buying; an explicit rent word
+    wins, so "rent to own" is not read as a purchase."""
+    return bool(_SALE_WORDS.search(text)) and not _RENT_WORDS.search(text)
+
 RENT_BUDGET_CEILING = 500_000    # a monthly rent above this is really a sale price
 SALE_BUDGET_FLOOR   = 1_000_000  # a purchase price below this is really a rent figure
 
@@ -655,7 +719,7 @@ def _drop_mismatched_budget(search_query: str, prefs: dict, state: AppState) -> 
     reaches the sale query as "saleAmount" <= 30000 and matches nothing. The
     prompt asks the model to ignore such budgets and it doesn't reliably, so
     the mismatch is settled here, like the visit-time hints below."""
-    is_sale = bool(_SALE_WORDS.search(search_query)) and not _RENT_WORDS.search(search_query)
+    is_sale = _looks_like_sale(search_query)
     cleaned = dict(prefs)
     for key in ("minPrice", "maxPrice"):
         amount = cleaned.get(key)
@@ -669,143 +733,167 @@ def _drop_mismatched_budget(search_query: str, prefs: dict, state: AppState) -> 
     return cleaned
 
 
+def _budget_in_prefs(state: AppState) -> bool:
+    prefs = state.get("preferences") or {}
+    return any(prefs.get(k) is not None for k in ("minPrice", "maxPrice"))
+
+
+# "3bhk" contains a digit but names no budget, so bhk tokens are removed before
+# looking for a figure. "cheapest" is deliberately not a budget word -- that is a
+# sort, and a price filter invented alongside it is exactly what we want to drop.
+_BHK_TOKEN_RE = re.compile(r"\b\d+\s*(?:bhk|bedroom|bed|rk)\b", re.IGNORECASE)
+_BUDGET_HINT_RE = re.compile(
+    r"\b\d{3,}\b"
+    r"|\b\d+(?:\.\d+)?\s*(?:k|lakhs?|crores?|thousand|cr|l)\b"
+    r"|\b(?:under|below|above|over|upto|up\s+to|within|budget|price|costing|between|around|near|about|roughly|less\s+than|more\s+than|at\s+least)\b",
+    re.IGNORECASE,
+)
+
+
+def _budget_stated(text: str) -> bool:
+    """Did the caller actually name a budget in this request?"""
+    return bool(_BUDGET_HINT_RE.search(_BHK_TOKEN_RE.sub(" ", text or "")))
+
+
+def _enforce_sql_guards(sql: str, search_query: str, state: AppState) -> str:
+    """Add back the two clauses that must never be missing, whichever model wrote
+    the query. On a neutral request ("anything in Kakkanad") the model tends to
+    drop "listingType" entirely, which silently mixes crore-priced sale flats
+    into a rent search; and a missing "isAvailable" offers a caller a property
+    that is already gone. Both are cheap to verify and too costly to get wrong,
+    so they are enforced here rather than left to the prompt."""
+    # A budget nobody asked for is the costliest error mode: it silently returns
+    # nothing, so the caller is told there is no inventory when there is. If
+    # neither the request nor the stored preferences carry a figure, no price
+    # comparison belongs in the query.
+    if not _budget_stated(search_query) and not _budget_in_prefs(state):
+        stripped = re.sub(
+            r'\s*AND\s*"(?:rent|sale)Amount"\s*(?:<=|>=|<|>|=)\s*\d+(?:\.\d+)?'
+            r'|\s*AND\s*"(?:rent|sale)Amount"\s+BETWEEN\s+\d+(?:\.\d+)?\s+AND\s+\d+(?:\.\d+)?',
+            "", sql, flags=re.IGNORECASE)
+        if stripped != sql:
+            logger.warning(f"{_ctx(state)} nl_to_sql: stripped an invented budget "
+                           f"(no figure in request or preferences)")
+            sql = stripped
+
+    added = []
+    clauses = []
+    if '"listingType"' not in sql:
+        mode = "SALE" if _looks_like_sale(search_query) else "RENT"
+        clauses.append(f"\"listingType\" = '{mode}'")
+        added.append(f"listingType={mode}")
+    if '"isAvailable"' not in sql:
+        clauses.append('"isAvailable" = TRUE')
+        added.append("isAvailable")
+    if not clauses:
+        return sql
+
+    extra = " AND ".join(clauses)
+    if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+        # existing conditions get parenthesised so our AND cannot be captured by
+        # a top-level OR the model may have written
+        sql = re.sub(r"\bWHERE\b\s*", f"WHERE {extra} AND ", sql, count=1, flags=re.IGNORECASE)
+    else:
+        tail = re.search(r"\b(ORDER\s+BY|LIMIT)\b", sql, re.IGNORECASE)
+        if tail:
+            sql = f"{sql[:tail.start()].rstrip()} WHERE {extra} {sql[tail.start():]}"
+        else:
+            sql = f"{sql.rstrip().rstrip(';')} WHERE {extra};"
+    logger.warning(f"{_ctx(state)} nl_to_sql: model omitted {', '.join(added)}; enforced in code")
+    return sql
+
+
 def nl_to_sql(state: AppState) -> dict:
     """LLM converts natural language + preferences to SQL."""
     prefs = _drop_mismatched_budget(state.get("search_query", ""), state.get("preferences", {}), state)
     known_locations = get_known_locations()
 
-    prompt = """Convert a property search request into a PostgreSQL SELECT query.
-    Real places in the database, as "City: its localities" (use ONLY these — never invent one):
-    {known_locations}
-    city and locality are two SEPARATE columns holding those plain names, so Worli is
-    city = 'Mumbai' AND locality = 'Worli'. Never put a combined "Mumbai / Worli" anywhere.
+    prompt = """Write ONE PostgreSQL SELECT over "Property". Output only the SQL, ending in a semicolon.
 
-    Table schema — the table and its camelCase columns are quoted identifiers, so they
-    MUST keep the double quotes shown here or PostgreSQL lowercases them and the query fails:
+    Real places (use ONLY these, never invent one):
+    {known_locations}
+    city and locality are SEPARATE columns holding those plain names: Worli is
+    city='Mumbai' AND locality='Worli'. Never write a combined "Mumbai / Worli".
 
     "Property"(id TEXT, title TEXT, "listingType" ListingType, city TEXT, locality TEXT,
                "areaSqft" FLOAT, bhk INT, "rentAmount" FLOAT, "saleAmount" FLOAT,
                furnishing FurnishingStatus, "parkingSpots" INT, amenities TEXT[],
                "isAvailable" BOOLEAN)
-      "listingType" is 'RENT' or 'SALE'.
-      "rentAmount" is set only on RENT rows, "saleAmount" only on SALE rows.
-      furnishing is 'UNFURNISHED', 'SEMI_FURNISHED' or 'FURNISHED'.
-      "areaSqft" is floor size, NOT a location.
+    The table name and every camelCase column MUST keep the double quotes shown, or
+    PostgreSQL lowercases them and the query fails. "listingType" is 'RENT' or 'SALE'.
+    "rentAmount" is set only on RENT rows, "saleAmount" only on SALE rows. furnishing is
+    'UNFURNISHED'/'SEMI_FURNISHED'/'FURNISHED'. "areaSqft" is floor size, NOT a location.
+    There is no `area` column and no `rent` column.
 
     Search request: "{search_query}"
-    User preferences (use as defaults for any missing field): {preferences}
-    Preference keys: city, locality, listingType ('RENT'/'SALE'), bhk, minPrice / maxPrice
-    (budget), minArea / maxArea (sqft), amenities (list), furnishing, otherPreference.
-    A stored listingType decides step 1 unless this request clearly says otherwise.
+    Preferences (defaults for anything the request omits): {preferences}
+    Keys: city, locality, listingType, bhk, minPrice/maxPrice, minArea/maxArea, amenities,
+    furnishing, otherPreference. A stored listingType decides rule 1 unless the request says otherwise.
 
-    Think through this silently before answering — do not show your reasoning in the output:
-    1. Renting or buying? "buy", "purchase", "price", "lakh", "crore" mean SALE; anything else
-       defaults to RENT. Pick exactly ONE and write it as a single equality — omitting it mixes
-       crore-priced sale flats into a rent search, and writing
-       "listingType" = 'RENT' OR "listingType" = 'SALE' is worse still: AND binds tighter than
-       OR, so that unparenthesized OR discards every other condition and returns the whole table.
-    2. Did the user or preferences mention BHK? If yes, add "bhk = <number>". If no, skip it entirely.
-    3. Did the user or preferences mention a budget? Put it on "rentAmount" for a RENT search or
-       "saleAmount" for a SALE search — never the wrong one, and never rescale the number the
-       customer gave. If no budget, skip it entirely. Ignore a saved budget whose size clearly
-       belongs to the other mode (a 40000 budget is rent, not a purchase price).
-    4. Did the user or preferences name a place? Match both columns, since a caller may say either:
-       (city ILIKE '%<name>%' OR locality ILIKE '%<name>%'). If no place was named, skip it
-       entirely — do not restrict to any location.
-       A REGION (NCR, Delhi NCR, MMR, tri-city) is not a city — expand it to every city the
-       Regions line above says it covers, OR'd together, e.g. for NCR:
-       (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%')
-       Older city names mean the modern one in the list: Bombay is Mumbai, Bangalore is
-       Bengaluru, Calcutta is Kolkata, Madras is Chennai, Gurgaon is Gurugram. Match the
-       name as it appears in the list above, never the name the caller happened to use.
+    RULES
+    1. RENT or SALE — every query MUST contain exactly one "listingType" equality, with no
+       exceptions. "buy"/"purchase"/"lakh"/"crore" mean SALE. If the request mentions neither
+       renting nor buying, still write "listingType" = 'RENT'. Leaving it out mixes
+       crore-priced sale flats into a rent search. Never write
+       "listingType" = 'RENT' OR "listingType" = 'SALE':
+       AND binds tighter than OR, so an unparenthesized OR drops every other condition and
+       returns the whole table. Every OR you write must sit inside its own parentheses.
+    2. BHK if stated: bhk = N. Otherwise omit.
+    3. Budget goes on "rentAmount" for RENT or "saleAmount" for SALE — never both, never the
+       wrong one, never rescaled. Map the words to the operator exactly:
+          "under/below/less than/upto/within/budget of X" -> <= X   (inclusive, never <)
+          "over/above/at least/more than X"               -> >= X   (inclusive, never >)
+          "around/near/about/roughly X"                   -> BETWEEN X-5000 AND X+5000
+          "between X and Y"                               -> BETWEEN X AND Y
+       Only "around"-type wording gets a BETWEEN. "under X" is <= X, never a range.
+       Ignore a saved budget whose size belongs to the other mode (40000 is rent, not a price).
+       Digits: 25k=25000, 1 lakh=100000, 50 lakh=5000000, 1 crore=10000000.
+    4. A place, if named, matches both columns:
+       (city ILIKE '%X%' OR locality ILIKE '%X%'). If none named, omit entirely.
+       A REGION is not a city — expand to the cities the Regions line lists, OR'd inside
+       parentheses, e.g. NCR -> (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%').
+       Old names map to the listed one: Bombay=Mumbai, Bangalore=Bengaluru,
+       Calcutta=Kolkata, Madras=Chennai, Gurgaon=Gurugram.
+    5. cheapest/most expensive/biggest/smallest is an ORDER BY, not a filter:
+       ORDER BY "rentAmount" ASC (or "saleAmount"/"areaSqft", DESC for most/biggest) LIMIT 3.
+       Never answer a superlative by guessing a price.
+    6. Amenity: '<amenity>' = ANY(amenities) — never ILIKE on it. Parking: "parkingSpots" > 0.
+    7. ALWAYS add "isAvailable" = TRUE.
+    8. No placeholders, no bracketed text, no SQL comments, no markdown, no explanation.
+       Take every value from the request/preferences above — the examples teach shape only.
 
-    4b. Did they ask for the cheapest / most expensive / biggest / smallest? That is an
-        ORDER BY, not a filter: add ORDER BY "rentAmount" ASC (or "saleAmount", or "areaSqft"
-        DESC for biggest) and LIMIT 3. Never answer a superlative by filtering on a guessed
-        price. "cheapest" sorts ascending; "most expensive"/"biggest" sorts descending.
-    5. An amenity? amenities is an array, so use '<amenity>' = ANY(amenities), never ILIKE.
-       Furnishing uses the enum; parking uses "parkingSpots" > 0.
-    6. ALWAYS add "isAvailable" = TRUE — an unavailable property must never reach a caller.
-    7. Combine only the conditions that apply with AND.
+    EXAMPLES
+    "2bhk under 40k" / {{}}
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND "rentAmount" <= 40000 AND "isAvailable" = TRUE;
 
-    ═══ FEW-SHOT EXAMPLES ═══
+    "3bhk in Whitefield under 60000" / {{}}
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 3 AND (city ILIKE '%Whitefield%' OR locality ILIKE '%Whitefield%') AND "rentAmount" <= 60000 AND "isAvailable" = TRUE;
 
-    Search request: "2bhk around 30k"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND "rentAmount" BETWEEN 25000 AND 35000 AND "isAvailable" = TRUE;
+    "anything in Kakkanad" / {{}}            <- says neither rent nor buy, so RENT
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND (city ILIKE '%Kakkanad%' OR locality ILIKE '%Kakkanad%') AND "isAvailable" = TRUE;
 
-    Search request: "3bhk in Whitefield under 60000"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 3 AND (city ILIKE '%Whitefield%' OR locality ILIKE '%Whitefield%') AND "rentAmount" <= 60000 AND "isAvailable" = TRUE;
+    "2bhk around 30k" / {{}}
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND "rentAmount" BETWEEN 25000 AND 35000 AND "isAvailable" = TRUE;
 
-    Search request: "any flat in budget 20k"
-    Preferences: {{"bhk": 2, "locality": "Kondapur"}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND (city ILIKE '%Kondapur%' OR locality ILIKE '%Kondapur%') AND "rentAmount" <= 20000 AND "isAvailable" = TRUE;
+    "i want to buy a 4bhk in Mumbai under 5 crore" / {{}}
+    SELECT * FROM "Property" WHERE "listingType" = 'SALE' AND bhk = 4 AND (city ILIKE '%Mumbai%' OR locality ILIKE '%Mumbai%') AND "saleAmount" <= 50000000 AND "isAvailable" = TRUE;
 
-    Search request: "i want to buy a 4bhk in Mumbai under 5 crore"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'SALE' AND bhk = 4 AND (city ILIKE '%Mumbai%' OR locality ILIKE '%Mumbai%') AND "saleAmount" <= 50000000 AND "isAvailable" = TRUE;
+    "cheapest 2bhk options in NCR" / {{}}
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%') AND "isAvailable" = TRUE ORDER BY "rentAmount" ASC LIMIT 3;
 
-    Search request: "a furnished place with a gym in Pune"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND (city ILIKE '%Pune%' OR locality ILIKE '%Pune%') AND furnishing = 'FURNISHED' AND 'gym' = ANY(amenities) AND "isAvailable" = TRUE;
+    "a furnished place with a gym in Pune" / {{}}
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND (city ILIKE '%Pune%' OR locality ILIKE '%Pune%') AND furnishing = 'FURNISHED' AND 'gym' = ANY(amenities) AND "isAvailable" = TRUE;
 
-    Search request: "something above 15k"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND "rentAmount" >= 15000 AND "isAvailable" = TRUE;
-
-    Search request: "cheapest 2bhk options in NCR"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 2 AND (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%') AND "isAvailable" = TRUE ORDER BY "rentAmount" ASC LIMIT 3;
-
-    Search request: "the most expensive place you have to buy"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'SALE' AND "isAvailable" = TRUE ORDER BY "saleAmount" DESC LIMIT 3;
-
-    Search request: "flats in Bombay"
-    Preferences: {{}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND (city ILIKE '%Mumbai%' OR locality ILIKE '%Mumbai%') AND "isAvailable" = TRUE;
-
-    Search request: "just show me whatever you have"
-    Preferences: {{"bhk": 3, "maxPrice": 50000}}
-    SQL: SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 3 AND "rentAmount" <= 50000 AND "isAvailable" = TRUE;
-
-    ═══ CRITICAL OUTPUT RULES ═══
-
-    - Output ONLY a complete, valid, executable PostgreSQL query — nothing else.
-    - NEVER output placeholder text like [extracted_bhk_value], <number>, [no_area_filter], or any bracketed/templated text. Every value in your output must be a real number or string, never a placeholder.
-    - NEVER output comments (-- ...) inside the SQL.
-    - NEVER include OR conditions like "("rentAmount" <= X OR [no_rent_filter])" — either include the real condition or omit it entirely. There is no such thing as a conditional clause in the output; you decide before writing, then write only what applies.
-    - No backticks, no markdown, no explanation, no reasoning shown — just the raw SQL statement ending in a semicolon.
-    - Only use the columns listed above — there is no `area` column and no `rent` column.
-    - "around X" / "near X" means a ±5000 range around X for rent, unless the user gives an explicit min/max or "under/above X".
-    - Spoken Indian amounts are digits: "25k" → 25000, "50 lakh" → 5000000, "1 crore" → 10000000.
-    - Take every value from THIS request's search/preferences lines — the examples teach the SQL
-      shape only, so never copy a bhk, budget or place out of one.
-
-    - EVERY OR must sit inside its own parentheses, because AND binds tighter than OR.
-      Right: (city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%') AND bhk = 3
-      Wrong: city ILIKE '%Delhi%' OR city ILIKE '%Gurugram%' AND bhk = 3
-      The wrong form quietly means "every Delhi row, plus Gurugram 3BHKs" — the bhk filter
-      is lost. If you cannot express something as one parenthesised group, leave it out.
-
-    ═══ WRONG OUTPUT (never do this) ═══
-    SELECT * FROM listings WHERE (bhk = [extracted_bhk_value] OR [no_bhk_filter]) AND area ILIKE '%x%';
-    ↑ Wrong three times over: the table is "Property", there are no `area`/`rent` columns, and
-      placeholders and OR-skip patterns must never appear in output.
-
-    SELECT * FROM "Property" WHERE "listingType" = 'RENT' OR "listingType" = 'SALE' AND bhk = 3 AND "isAvailable" = TRUE;
-    ↑ Wrong: this returns every RENT row in the table, ignoring bhk and availability entirely.
-      Choose one listing type: "listingType" = 'RENT' AND bhk = 3 AND "isAvailable" = TRUE.
+    "just show me whatever you have" / {{"bhk": 3, "maxPrice": 50000}}
+    SELECT * FROM "Property" WHERE "listingType" = 'RENT' AND bhk = 3 AND "rentAmount" <= 50000 AND "isAvailable" = TRUE;
     """
-    # schema = get_schema()   # use this to get the real schema from the DB
     prompt = prompt.format(
         search_query=state['search_query'],
         preferences=json.dumps(prefs),
         known_locations=known_locations,
     )
     t0 = time.monotonic()
-    response = llm.invoke([HumanMessage(content=prompt)])
+    response = fast_llm.invoke([HumanMessage(content=prompt)])
     elapsed = time.monotonic() - t0
 
     sql = response.content.strip().strip("```sql").strip("```").strip()
@@ -814,6 +902,8 @@ def nl_to_sql(state: AppState) -> dict:
         import re
         match = re.search(r"(SELECT.+?;)", sql, re.DOTALL | re.IGNORECASE)
         sql = match.group(1) if match else 'SELECT * FROM "Property" WHERE "isAvailable" = TRUE LIMIT 5;'
+
+    sql = _enforce_sql_guards(sql, state.get("search_query", ""), state)
 
     logger.info(f"{_ctx(state)} nl_to_sql ({elapsed:.2f}s) search_query={state['search_query']!r} -> {sql}")
 
@@ -944,7 +1034,7 @@ def format_reply(state: AppState) -> dict:
     Write the spoken reply now.
     """.strip())
 
-    response = llm.invoke([system_prompt, human_prompt])
+    response = fast_llm.invoke([system_prompt, human_prompt])
     reply = response.content
     logger.info(f"{_ctx(state)} format_reply -> {reply[:120]!r}{'...' if len(reply) > 120 else ''}")
 

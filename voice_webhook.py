@@ -12,6 +12,7 @@ import uuid
 import json
 import re
 import asyncio
+import threading
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -308,6 +309,93 @@ async def chat_completions(request: Request):
     return JSONResponse(_completion_payload(call_id, reply))
 
 
+# ── Token streaming ───────────────────────────────────────────────────────────
+# Nothing used to reach Vapi until the whole turn had finished computing, so the
+# caller heard silence for the entire turn. Forwarding tokens as they are
+# generated lets Vapi's TTS start on the first few words.
+
+_TAG_RE = re.compile(r"(PREF_UPDATE|SEARCH|FINALIZE)\s*:", re.IGNORECASE)
+_REPLY_PREFIX_RE = re.compile(r"^\s*REPLY\s*:\s*", re.IGNORECASE)
+_TAG_HOLDBACK = 14  # longest tag name + colon, so a marker is never half-emitted
+
+
+class _ReplyGate:
+    """Exposes only the REPLY part of chat's tagged output, incrementally.
+
+    chat emits "REPLY: ... PREF_UPDATE: {...} SEARCH: ...". Streaming that raw
+    would have TTS read the tag names to the caller -- the same bug already
+    fixed once in parse_intent. Text is released only once it cannot still turn
+    out to be the start of a tag marker."""
+
+    def __init__(self):
+        self._buf = ""
+        self._sent = 0
+        self.closed = False
+
+    def feed(self, token: str) -> str:
+        if self.closed:
+            return ""
+        self._buf += token
+        text = _REPLY_PREFIX_RE.sub("", self._buf)
+        match = _TAG_RE.search(text)
+        if match:
+            text = text[:match.start()]
+            self.closed = True
+        safe = text if self.closed else text[:max(0, len(text) - _TAG_HOLDBACK)]
+        out = safe[self._sent:]
+        self._sent += len(out)
+        return out
+
+
+def _split_sentences(buf: str):
+    """Peel off complete sentences. clean_for_voice rewrites whole figures
+    ("25,000" -> "twenty five thousand"), so it must never see a number split
+    across two token boundaries -- flushing on sentence ends guarantees that."""
+    done = []
+    while True:
+        m = re.search(r"[.!?](?=\s|$)", buf)
+        if not m:
+            break
+        done.append(buf[:m.end()])
+        buf = buf[m.end():].lstrip()
+    return done, buf
+
+
+async def _graph_token_stream(phone_number: str, thread_id: str, transcript: str, config: dict):
+    """Bridge LangGraph's synchronous token stream onto the event loop.
+
+    The checkpointer is the sync PostgresSaver, so graph.stream() must run in a
+    worker thread; tokens are handed back through a queue. Yields
+    (node_name, text) pairs, and resumes past the nl_to_sql interrupt itself."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    def pump():
+        try:
+            def forward(payload):
+                for chunk, meta in graph.stream(payload, config, stream_mode="messages"):
+                    text = getattr(chunk, "content", "") or ""
+                    if text:
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait, (meta.get("langgraph_node", ""), text))
+
+            forward(_build_initial_state(phone_number, thread_id, transcript))
+            while graph.get_state(config).next:      # paused before nl_to_sql
+                forward(None)
+        except Exception as exc:                      # surfaced to the caller below
+            loop.call_soon_threadsafe(queue.put_nowait, ("__error__", repr(exc)))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, done)
+
+    threading.Thread(target=pump, daemon=True).start()
+    while True:
+        item = await queue.get()
+        if item is done:
+            return
+        yield item
+
+
 async def _sse_stream_with_filler(call_id: str, phone_number: str, thread_id: str, transcript: str):
     """Streams a reply, injecting a filler line ONLY when this turn is about
     to run an actual property search (chat -> parse_intent -> nl_to_sql ->
@@ -331,31 +419,81 @@ async def _sse_stream_with_filler(call_id: str, phone_number: str, thread_id: st
     chunk_id = f"chatcmpl-{call_id}"
     config = {"configurable": {"thread_id": thread_id}}
     t0 = time.monotonic()
+    first_at = None
+    spoken = []
+    gate = _ReplyGate()
+    pending = ""      # partial sentence not yet safe to voice-clean
+    failed = False
+
+    def delta(text):
+        return f"data: {json.dumps(_delta_chunk(chunk_id, created, text))}\n\n"
 
     # See _get_conversation_lock: Vapi can fire an overlapping request for
     # this same call if the previous turn is slow to reply, so this turn
     # waits its turn instead of racing the graph concurrently.
     async with _get_conversation_lock(phone_number):
         try:
-            result = await asyncio.to_thread(graph.invoke, _build_initial_state(phone_number, thread_id, transcript), config)
+            async for node, text in _graph_token_stream(phone_number, thread_id, transcript, config):
+                if node == "__error__":
+                    raise RuntimeError(text)
 
-            if (await asyncio.to_thread(graph.get_state, config)).next:
-                filler = "Sure, let me check that for you.<flush />"
-                yield f"data: {json.dumps(_delta_chunk(chunk_id, created, filler))}\n\n"
-                result = await asyncio.to_thread(graph.invoke, None, config)
+                # chat's output carries the internal tags, so it goes through the
+                # gate. format_reply's output is already the caller-facing reply.
+                if node == "chat":
+                    text = gate.feed(text)
+                elif node != "format_reply":
+                    continue          # other nodes emit no caller-facing text
+                if not text:
+                    continue
 
-            reply = clean_for_voice(result["messages"][-1].content)
-            elapsed = time.monotonic() - t0
-            logger.info(f"[phone={phone_number} thread={thread_id[:8]}] graph.invoke completed in {elapsed:.2f}s -> {reply[:120]!r}")
+                sentences, pending = _split_sentences(pending + text)
+                for sentence in sentences:
+                    cleaned = clean_for_voice(sentence)
+                    if not cleaned:
+                        continue
+                    if first_at is None:
+                        first_at = time.monotonic() - t0
+                        # tell Vapi to start speaking rather than buffer for more
+                        cleaned += "<flush />"
+                    spoken.append(cleaned)
+                    yield delta(cleaned)
+
+            if pending.strip():
+                cleaned = clean_for_voice(pending)
+                if cleaned:
+                    if first_at is None:
+                        first_at = time.monotonic() - t0
+                    spoken.append(cleaned)
+                    yield delta(cleaned)
         except Exception:
-            elapsed = time.monotonic() - t0
+            failed = True
             logger.exception(
-                f"[phone={phone_number} thread={thread_id[:8]}] graph.invoke FAILED after {elapsed:.2f}s "
-                f"for transcript={transcript!r}"
+                f"[phone={phone_number} thread={thread_id[:8]}] streaming FAILED after "
+                f"{time.monotonic() - t0:.2f}s for transcript={transcript!r}"
             )
-            reply = "Sorry, I ran into an issue looking that up. Could you say that again?"
 
-    yield f"data: {json.dumps(_delta_chunk(chunk_id, created, reply))}\n\n"
+        # Nodes that build their reply in code rather than from an LLM
+        # (start_booking, booking_flow) stream no tokens at all, so fall back to
+        # whatever the finished state holds. Also covers a mid-stream failure.
+        if not spoken:
+            try:
+                final = (await asyncio.to_thread(graph.get_state, config)).values
+                reply = clean_for_voice(final["messages"][-1].content)
+            except Exception:
+                logger.exception(f"[phone={phone_number}] could not read final state")
+                reply = "Sorry, I ran into an issue looking that up. Could you say that again?"
+            if first_at is None:
+                first_at = time.monotonic() - t0
+            spoken.append(reply)
+            yield delta(reply)
+
+    elapsed = time.monotonic() - t0
+    logger.info(
+        f"[phone={phone_number} thread={thread_id[:8]}] turn done in {elapsed:.2f}s "
+        f"(first audio at {first_at:.2f}s){' [FAILED]' if failed else ''} "
+        f"-> {' '.join(spoken)[:120]!r}"
+    )
+
     yield f"data: {json.dumps(_final_chunk(chunk_id, created))}\n\n"
     yield "data: [DONE]\n\n"
 
