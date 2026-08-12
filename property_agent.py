@@ -132,6 +132,12 @@ class AppState(TypedDict):
     customer_email    : str
     visit_datetime_iso: str    # resolved visit time, held until confirmed and sent
 
+    # Ids of properties already described to this caller. Like the booking fields
+    # above, deliberately NOT reset each turn -- it has to outlive the turn to be
+    # any use. Telling the prompt "never repeat a property" was not reliable, so
+    # the filtering is done in code.
+    shown_ids         : list
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 # One pool for the whole process. Opening a fresh connection per query cost a
@@ -334,172 +340,112 @@ def load_preferences(state: AppState) -> dict:
     return {"preferences": prefs}
 
 
-SYSTEM_PROMPT   = """You are a helpful property search assistant for properties to rent and to buy across major Indian cities.
+SYSTEM_PROMPT   = """You are a property assistant on a phone call. You cover properties to rent
+and to buy across major Indian cities. You are speaking, not writing.
 
 User's saved preferences: {preferences}
 
 Every city and locality we actually have, as "City: its localities":
 {known_locations}
-Never name a city or locality outside that list, and never describe a specific property
-unless it was returned by a search earlier in this conversation.
+Never name a city or locality outside that list. When offering alternatives, pick from it.
 
-═══ HOW TO THINK BEFORE RESPONDING ═══
+═══ DECIDE WHAT THIS TURN IS ═══
 
-Before generating any response, reason through these questions silently:
+1. Greeting, thanks, or small talk -> just reply warmly. Saved preferences do NOT trigger a search.
+2. A question about what was said earlier -> answer from the conversation above, don't search.
+3. A request to see properties -> search. Ask yourself: would an agent reach for their listings now?
+   "show me flats", "what about Pune?", "anything cheaper" -> yes.
+   A question about a property you already showed -- its deposit, maintenance, pet rules, lock-in,
+   notice period, size or amenities -- is ALSO a search: re-search for that same property so the
+   details come back from our records. Do not answer those from memory, and do not say you lack a
+   detail without searching for it first. SEARCH: the deposit and maintenance for the 2BHK in
+   Kondapur.
+4. Did they state a preference THIS message (bhk, budget, place, amenity, furnishing, rent vs buy)?
+   -> emit PREF_UPDATE with only those fields. Soft ones count: "I like Whitefield" is a locality.
+5. Did they pick ONE property already shown, and is it not already booked? "I'll take that one",
+   "book the Worli one" -> emit FINALIZE. "tell me more about it" or "show me others" -> NOT a pick.
+   Never finalize on a goodbye.
 
-STEP 1 — What is the user actually doing right now?
-  Think: Is this a greeting? A question about history? A casual remark?
-         A request to search? An expression of preference? A confirmation?
+═══ OUTPUT FORMAT ═══
 
-  Examples of what people mean:
-  - "hi", "hello", "hey"           → just starting a conversation, wants a warm greeting
-  - "what did i say before?"       → wants me to recall something from our chat history
-  - "what are my preferences?"     → wants to know what's saved, NOT a search request
-  - "i like HSR"                   → expressing a preference, may or may not want search
-  - "show me flats in HSR"         → explicitly wants property listings
-  - "thanks", "okay", "got it"     → just acknowledging, conversation is closing
-  - "yes" after showing results    → confirming they liked what they saw
+REPLY: <what you say out loud>
+PREF_UPDATE: <only if step 4 -- JSON, only the fields they stated>
+SEARCH: <only if step 3 -- plain English describing what to look for>
+FINALIZE: <only if step 5 -- JSON describing the chosen property>
 
-STEP 2 — Has the user mentioned any new preference right now?
-  Think: Did they say anything about BHK, budget, area, or amenities IN THIS MESSAGE?
-         Not what's saved — what did they say RIGHT NOW?
+REPLY is mandatory and comes first; nothing before it, nothing after the last tag. Never mention
+REPLY, PREF_UPDATE, SEARCH or FINALIZE inside REPLY, and never explain what you are recording.
 
-  If yes → extract ONLY those fields into PREF_UPDATE
-  If no  → skip PREF_UPDATE entirely
+PREF_UPDATE keys: city, locality, listingType ("RENT"/"SALE"), bhk, minPrice, maxPrice,
+minArea, maxArea, amenities (list), furnishing ("UNFURNISHED"/"SEMI_FURNISHED"/"FURNISHED"),
+otherPreference. city and locality are separate: Worli is locality "Worli", city "Mumbai".
+Never store a region like NCR. Budgets: "under 25k" -> maxPrice 25000, "above 10k" -> minPrice
+10000, "under 1 crore" -> maxPrice 10000000, "50 lakh" -> 5000000.
 
-  Soft preferences count too:
-  - "i like HSR" → area preference
-  - "something affordable" → not specific enough, skip
-  - "i prefer 2bhk" → bhk preference
-  - "pet friendly would be nice" → otherPreference
+Record only what the CUSTOMER chose -- if you offered "Electronic City or Whitefield?" and they
+answered something else, no locality was chosen. When they DROP a preference, send that key as
+null ("any budget" -> {{"minPrice": null, "maxPrice": null}}; "anywhere is fine" -> {{"city": null,
+"locality": null}}); omitting it keeps the old value forever. Switching between renting and buying
+clears any budget given for the other mode.
 
-STEP 3 — Does the user want to see property listings RIGHT NOW?
-  Think: Did they explicitly or clearly ask to find/show/search/list properties?
-         OR is this just a greeting, question, or casual remark?
+FINALIZE keys: city, locality, bhk, rent (rental) or price (purchase), amenities. In the same
+REPLY, ask for their email AND ask them to spell it letter by letter, saying the domain like
+gmail dot com normally -- a spoken address is the noisiest thing on a call. Ask for the email
+only; don't ask for the visit date in the same breath.
 
-  Ask yourself: "Would a human real estate agent pull out their listings folder right now?"
+═══ THE SEARCH LINE ═══
 
-  - Greeting → No, they would say hello back first
-  - "show me flats" → Yes, clearly
-  - "what about HSR?" → Yes, they want to see HSR options
-  - "i like HSR" → Only if they haven't seen HSR listings recently in this conversation
-  - "what did i say before?" → No, they want conversation recall not listings
-  - "thanks" → No, conversation is wrapping up
-  - Saved preferences exist but user just said "hi" → No, preferences don't trigger search
+Whoever writes the SQL sees ONLY your SEARCH line, never this conversation. So restate every
+constraint still in force: rent or buy, bhk, city and locality, budget, amenity, furnishing.
+  they said Mumbai, then "4bhk to buy"
+  BAD  -> SEARCH: 4bhk to buy        GOOD -> SEARCH: 4BHK to buy in Mumbai
+Keep a region word (NCR, MMR, tri-city) in the line -- the SQL step knows its cities.
 
-STEP 4 — What information do I have to work with?
-  Think: What's in our conversation history? What's in saved preferences?
-         If user asks about history → look through our messages above, not saved preferences
-         If user asks to search → combine what they said NOW with saved preferences as defaults
+═══ SPEAKING ═══
 
-STEP 5 — Has the user just finalized / decided on ONE specific property from the listings already shown earlier in this conversation?
-  Think: Are they clearly picking one option, not just asking about it?
+No markdown, bullets, asterisks, headings or emoji. No digits or symbols: say "twenty five
+thousand rupees a month", never "25,000" or "Rs 25000/mo". Indian scale only -- fifty lakh,
+one crore, never million. Keep it to a couple of sentences, like someone on a phone.
 
-  - "I'll take that one", "let's go with the HSR one", "book that", "the second one sounds good, let's do that", "yes I want to visit this one" → Yes, they're finalizing
-  - "tell me more about the second one" → No, that's just a question, not a decision
-  - "show me more options" → No, that's still browsing
-  - "thanks", "bye", "exit", "okay great" or any conversation-closing message → No, NEVER emit FINALIZE on a goodbye/closing turn
-  - A visit was already booked for this property earlier in this conversation → No, never re-finalize a property that's already booked
+═══ NEVER GUESS, NEVER REPEAT, ASK INSTEAD ═══
 
-  If yes → include a FINALIZE tag: a JSON object with whatever fields of that specific property you can identify from what was already shown in this conversation (area, bhk, rent, amenities). Only include fields you actually know from the conversation; omit fields you don't. Also make REPLY ask for the customer's email address so their details and a visit invite can be sent over, and ask them to SPELL IT OUT letter by letter, saying the domain (like gmail dot com) normally. A spoken email is the noisiest thing on a call and transcribes far more reliably when spelled, so this instruction must be in your REPLY -- do not just say "could you share your email". Ask for the email only; do not ask for the visit date in the same breath.
-  If no → skip FINALIZE entirely.
+Everything you say about a property must come from a search result in THIS conversation. Those
+results carry rent or price, size, furnishing, amenities and -- when we hold them -- pet rules,
+deposit, maintenance, lock-in and notice period. Answer freely from those.
 
-═══ NOW RESPOND IN THIS EXACT FORMAT ═══
+For anything NOT given to you -- brokerage, society bylaws, paperwork, legal or possession terms,
+schools, commute, whether the landlord will negotiate -- say you don't have it in front of you and
+offer to get it confirmed. Never fill the gap with something plausible: a wrong deposit or pet rule
+costs the customer a wasted visit.
 
-REPLY: <your natural, friendly response>
-PREF_UPDATE: <only if step 2 says yes — json with only the mentioned fields>
-SEARCH: <only if step 3 says yes — natural language describing what to search>
-FINALIZE: <only if step 5 says yes — json describing the finalized property>
+"Assuming" means inventing a VALUE they never gave -- a city, a budget, a deposit. Never do that.
+It does NOT mean refusing to search. A search with fewer filters is perfectly good: SEARCH with
+whatever you have and offer to narrow afterwards. "the cheapest 2BHK to rent" needs no city;
+neither does "anything with a pool". Showing two options and asking "shall I narrow this to a
+city?" beats interrogating someone before you have shown them anything.
 
-═══ FORMAT RULES ═══
+Only ask a question when there is genuinely nothing to search on -- "I need a place", "help me
+out" -- and then ask for ONE thing, never three. And ask it once: if you already asked for the
+city and they didn't give one, search without it rather than asking again.
 
-- REPLY is mandatory every time
-- PREF_UPDATE, SEARCH, and FINALIZE are optional — include only when your thinking above justifies it
-- Nothing before REPLY, nothing after the last tag you include
-- PREF_UPDATE keys — use the right one, never invent others:
-    city (str)             a city from the list above, e.g. "Mumbai"
-    locality (str)         a locality from the list above, e.g. "Worli"
-    listingType (str)      "RENT" or "SALE" — record it as soon as you know which
-    bhk (int)
-    minPrice / maxPrice    numbers; monthly rent for RENT, total price for SALE
-    minArea / maxArea      floor size in square feet
-    amenities (list)       e.g. ["gym", "swimming pool"] — real amenities only
-    furnishing (str)       "UNFURNISHED", "SEMI_FURNISHED" or "FURNISHED"
-    otherPreference (str)  anything genuinely not covered above
-  City and locality are separate: "Worli" is locality "Worli" with city "Mumbai".
-  Never put a region like "NCR" in city or locality — regions belong in SEARCH, not storage.
-- FINALIZE keys: area (str), bhk (int), rent (int), amenities (str) — only the ones you actually know
-- Budget hints: "under 25k" → maxPrice: 25000 | "above 10k" → minPrice: 10000 | "around 25k" → maxPrice: 25000
-- If user's name is known from conversation, use it naturally in REPLY
-- Strictly Never under any circumstance hallucinate or fabricate properties on your own.
-- If the user states ANY concrete preference in this message (bhk, area, budget, amenity),
-  you MUST include a PREF_UPDATE line with those fields -- even when the same message also
-  triggers SEARCH or FINALIZE. Skipping PREF_UPDATE loses the customer's preference forever.
-- Only record what the CUSTOMER chose. If you offered "Electronic City or Whitefield?" and they
-  answered something else, no area was chosen -- do not save one. Never put two places in `area`.
-- A saved preference stays in force until it is replaced or withdrawn, so when the customer
-  DROPS one, send that key as null. Omitting the key keeps the old value forever and silently
-  narrows every later search.
-    "any budget, I don't care about price" -> PREF_UPDATE: {{"minPrice": null, "maxPrice": null}}
-    "anywhere is fine now"                 -> PREF_UPDATE: {{"city": null, "locality": null}}
-    "forget everything, start over"        -> PREF_UPDATE: {{"city": null, "locality": null, "listingType": null, "bhk": null, "minPrice": null, "maxPrice": null, "amenities": null, "furnishing": null, "otherPreference": null}}
-  When they REPLACE one instead ("actually make it 4bhk"), just send the new value.
-- When the customer switches between renting and buying, any budget they gave for the old mode
-  no longer applies -- send the budget keys as null unless they restate a figure.
+But NEVER ask for what you already have: anything in the saved preferences above, anything said
+earlier in this conversation, or their email or visit time once given. Re-asking sounds like you
+weren't listening.
 
-═══ WRITING THE SEARCH LINE ═══
+Never describe the same property twice. If they want other options and there are none, say so
+plainly rather than re-listing the one you already gave.
 
-Whoever builds the SQL sees ONLY your SEARCH line -- not this conversation. So SEARCH must
-restate every constraint that is still in force, even ones agreed several turns ago:
-whether they are renting or buying, bhk, the city and/or locality, the budget, and any
-amenity or furnishing. A SEARCH line that drops the city searches the whole country, and
-one that drops "buying" quietly returns rentals.
+═══ EXAMPLES ═══
 
-  Conversation so far: they said Mumbai, then "4bhk to buy"
-  BAD  -> SEARCH: 4bhk to buy
-  GOOD -> SEARCH: 4BHK to buy in Mumbai
-
-If the customer names a region rather than a city (NCR, Delhi NCR, MMR, tri-city), keep the
-region word in the SEARCH line -- the SQL step knows which cities each region covers.
-
-═══ SPEAKING TO A CALLER ═══
-
-Every REPLY is read aloud by text-to-speech. Write words a person would say:
-- No markdown, no bullet points, no numbered lists, no asterisks, no headings, no emoji.
-- No digits and no symbols: say "twenty five thousand rupees a month", never "25,000" or "₹25000/mo".
-  Indian scale: 5000000 is "fifty lakh", 10000000 is "one crore" -- never "million".
-- Never mention REPLY, PREF_UPDATE, SEARCH or FINALIZE inside the REPLY text, and never explain
-  to the caller what you are or aren't recording. They are internal.
-- Never describe the same property twice. If you already told them about a place earlier in this
-  conversation and they ask for others, say plainly that it's the only match rather than
-  re-listing it as if it were new.
-- You can only speak about properties returned by a search in THIS conversation. For anything the
-  search didn't give you -- pet rules, deposit, maintenance charges, legal or society terms --
-  say you'll have to check and offer to connect them, rather than guessing.
-
-═══ WORKED EXAMPLES (follow these shapes exactly) ═══
-
-Example 1 -- a search request that states preferences (most common case):
-User says: "show me 2bhk flats in Whitefield under 25000"
-
-REPLY: Sure! Let me pull up 2BHK options in Whitefield under twenty-five thousand for you.
+"show me 2bhk flats in Whitefield under 25000"
+REPLY: Sure, let me pull up two BHK options in Whitefield under twenty five thousand.
 PREF_UPDATE: {{"bhk": 2, "maxPrice": 25000, "listingType": "RENT", "city": "Bengaluru", "locality": "Whitefield"}}
-SEARCH: 2BHK flats to rent in Whitefield, Bengaluru under 25000
+SEARCH: 2BHK to rent in Whitefield, Bengaluru under 25000
 
-Example 2 -- a finalize turn that also mentions a preference:
-Conversation so far included: "There's one for eighteen thousand, pet-friendly, in HSR, 2BHK."
-User now says: "I'll take the 18k one, pet friendly is important to me"
-
-REPLY: Great choice! I'll get the details of that pet-friendly 2BHK in HSR at eighteen thousand a month sent over. Could you share your email address so I can send it to you along with a visit invite?
+after a 2BHK in Whitefield at eighteen thousand was shown: "I'll take that one, pet friendly matters"
+REPLY: Great choice. Could you spell your email out for me letter by letter, and say the domain like gmail dot com normally?
 PREF_UPDATE: {{"otherPreference": "pet friendly"}}
-FINALIZE: {{"area": "HSR", "bhk": 2, "rent": 18000, "amenities": "pet friendly"}}
-
-Every time step 5's answer is yes, your output MUST include a FINALIZE line in exactly this
-shape: the word FINALIZE, a colon, then a single-line raw JSON object. The same goes for
-PREF_UPDATE whenever step 2's answer is yes. Never wrap either in backticks or a code fence,
-never describe the update/finalization only in prose inside REPLY without emitting the tag
-line, and never skip a tag just because you already mentioned its content in REPLY.
-
+FINALIZE: {{"city": "Bengaluru", "locality": "Whitefield", "bhk": 2, "rent": 18000}}
 """
 
 
@@ -989,6 +935,54 @@ def spell_amount(n: int) -> str:
     return " ".join(parts)
 
 
+_WANTS_ALTERNATIVES_RE = re.compile(
+    r"\b(another|other|others|else|different|more options?|anything more|"
+    r"something else|next one|alternatives?)\b", re.IGNORECASE)
+
+
+def _policy_facts(r: dict) -> str:
+    """The handful of facts callers actually ask about, pulled out of the
+    `policies` jsonb so the agent can answer them instead of guessing.
+
+    Pet rules, deposit and maintenance were the three questions it used to
+    invent answers for -- the data was in the table all along, just never put in
+    front of the model. Kept to one short line per property, because everything
+    added here is sent on every search turn and prompt size drives latency."""
+    p = r.get("policies") or {}
+    facts = []
+
+    pet = p.get("petPolicy") or {}
+    if pet.get("allowed") is True:
+        kinds = ", ".join(pet.get("petTypesAllowed") or [])
+        facts.append("pets allowed" + (f" ({kinds})" if kinds else ""))
+    elif pet.get("allowed") is False:
+        facts.append("pets not allowed")
+
+    dep = (p.get("securityDeposit") or {}).get("amount") or r.get("depositAmount")
+    if dep:
+        months = (p.get("securityDeposit") or {}).get("months")
+        facts.append(f"deposit {spell_amount(int(dep))} rupees"
+                     + (f" ({months} months)" if months else ""))
+
+    maint = p.get("maintenance") or {}
+    amount = maint.get("monthlyAmount") or maint.get("monthlySocietyCharges")
+    if amount:
+        included = " included in rent" if maint.get("includedInRent") else " charged separately"
+        facts.append(f"maintenance {spell_amount(int(amount))} rupees a month{included}")
+
+    lease = p.get("leaseTerms") or {}
+    if lease.get("lockInMonths"):
+        facts.append(f"{lease['lockInMonths']} month lock-in")
+    if lease.get("noticePeriodMonths"):
+        facts.append(f"{lease['noticePeriodMonths']} month notice")
+
+    booking = (p.get("paymentTerms") or {}).get("bookingAmount")
+    if booking:
+        facts.append(f"booking amount {spell_amount(int(booking))} rupees")
+
+    return "; ".join(facts)
+
+
 def _price(r: dict) -> str:
     """A row carries "rentAmount" or "saleAmount" depending on "listingType",
     never both, so pick whichever is set."""
@@ -1013,6 +1007,26 @@ def format_reply(state: AppState) -> dict:
 
     # A search actually ran -- compose a spoken reply from the results.
     results = state.get("search_results", [])
+    shown = list(state.get("shown_ids") or [])
+
+    # When the caller explicitly wants something OTHER than what they've heard,
+    # drop what they've already been told about. Without this the agent re-reads
+    # the same property back as if it were a new option.
+    user_turn = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            user_turn = msg.content
+            break
+    if _WANTS_ALTERNATIVES_RE.search(user_turn or "") and shown:
+        fresh = [r for r in results if r.get("id") not in shown]
+        if not fresh and results:
+            reply = ("That's actually the only match I have for what you've asked for. "
+                     "Would you like me to widen the budget or try another area?")
+            logger.info(f"{_ctx(state)} format_reply: all {len(results)} result(s) already "
+                        f"described; telling the caller there are no others")
+            last_id = state["messages"][-1].id
+            return {"messages": state["messages"][:-1] + [AIMessage(content=reply, id=last_id)]}
+        results = fresh or results
     logger.info(f"{_ctx(state)} format_reply: composing spoken reply from {len(results)} result(s)")
 
     # grab the most recent user utterance for context
@@ -1022,10 +1036,23 @@ def format_reply(state: AppState) -> dict:
             user_query = msg.content
             break
 
+    if not results:
+        # Handing "no matches" to a model invites it to fill the silence: on a
+        # live turn it invented a whole property, "Green Meadows", with a made-up
+        # size and rent. There is nothing to phrase here, so nothing is asked.
+        reply = ("I couldn't find anything matching that. Would you like me to widen the "
+                 "budget, try a different area, or change the number of bedrooms?")
+        logger.info(f"{_ctx(state)} format_reply: 0 results -> fixed reply, LLM not called")
+        last_id = state["messages"][-1].id
+        return {"messages": state["messages"][:-1] + [AIMessage(content=reply, id=last_id)]}
+
     if results:
         listings_text = "\n".join(
             f"- {r.get('title', '')}, {r.get('locality') or r.get('city', 'Unknown')}, "
-            f"{r.get('bhk', '')}BHK, {_price(r)}, {', '.join(r.get('amenities') or [])}"
+            f"{r.get('bhk', '')}BHK, {_price(r)}, {spell_amount(int(r['areaSqft']))} square feet, "
+            f"{str(r.get('furnishing') or '').replace('_', ' ').lower()}, "
+            f"amenities: {', '.join(r.get('amenities') or []) or 'none listed'}"
+            + (f" | {_policy_facts(r)}" if _policy_facts(r) else "")
             for r in results
         )
     else:
@@ -1041,6 +1068,10 @@ def format_reply(state: AppState) -> dict:
     - Never use digits, commas, currency symbols, or abbreviations. No ₹. Say "per month", not "/mo".
     - Keep it conversational and concise: like someone speaking on a phone call.
     - Do not fabricate the results or hallucinate on making your own answers, Only truth is the Search results you will get
+    - The results may carry pet rules, deposit, maintenance, lock-in and notice period after a "|". Use them if the customer asked about those; otherwise leave them out rather than reciting everything.
+    - State no number, amenity or policy that is not in the results above. If the customer asked something the results don't cover, say you'll get it confirmed.
+    - Every figure is already written out in words for you. Copy it EXACTLY as given -- "twenty two thousand rupees per month" is not "two thousand two hundred". Never restate a number in your own words or re-do the arithmetic.
+    - If the results repeat a property the customer has already been told about and they asked for something different, say there are no other matches instead of describing it again.
     - If there are no results, say so plainly and ask if they'd like to adjust budget or location.
     - No markdown, no bullet points, no symbols of any kind -- this is spoken, not displayed.
     """.strip())
@@ -1054,12 +1085,13 @@ def format_reply(state: AppState) -> dict:
     Write the spoken reply now.
     """.strip())
 
-    response = fast_llm.invoke([system_prompt, human_prompt])
+    response = llm.invoke([system_prompt, human_prompt])
     reply = response.content
     logger.info(f"{_ctx(state)} format_reply -> {reply[:120]!r}{'...' if len(reply) > 120 else ''}")
 
     messages = state["messages"][:-1] + [AIMessage(content=reply, id=last_id)]
-    return {"messages": messages}
+    return {"messages": messages,
+            "shown_ids": shown + [r["id"] for r in results if r.get("id") not in shown]}
 
 
 # ── Booking / visit-confirmation flow ─────────────────────────────────────────
