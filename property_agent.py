@@ -22,6 +22,7 @@ import smtplib
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import ast
 import threading
 import psycopg
 from psycopg.rows import dict_row
@@ -1131,6 +1132,30 @@ def _mold_spoken_email(text: str) -> str:
     return molded
 
 
+def _amenity_words(value) -> str:
+    """Amenities as speakable words. The FINALIZE tag sometimes carries a real
+    list and sometimes a stringified one, and the raw value was interpolated
+    straight into speech -- callers heard "(['clubhouse', 'Wi-Fi'])" complete
+    with brackets and quotes."""
+    if not value:
+        return ""
+    if isinstance(value, (list, tuple)):
+        items = [str(v) for v in value]
+    else:
+        text = str(value).strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                # literal_eval copes with the apostrophe in "children's play area",
+                # which a naive quote-matching regex truncates to "children"
+                parsed = ast.literal_eval(text)
+                items = [str(v) for v in parsed] if isinstance(parsed, (list, tuple)) else [str(parsed)]
+            except (ValueError, SyntaxError):
+                items = [p.strip(" '\"") for p in text.strip("[]").split(",")]
+        else:
+            items = [text]
+    return ", ".join(i.strip().strip("'\"") for i in items if i.strip())
+
+
 def describe_property(prop: dict) -> str:
     """Human-readable one-liner for a property dict, for use in replies/emails."""
     if not prop:
@@ -1138,12 +1163,17 @@ def describe_property(prop: dict) -> str:
     parts = []
     if prop.get("bhk"):
         parts.append(f"{prop['bhk']}BHK")
-    if prop.get("area"):
-        parts.append(f"in {prop['area']}")
+    where = prop.get("locality") or prop.get("city") or prop.get("area")
+    if where:
+        parts.append(f"in {where}")
+    # a rental carries `rent`, a purchase carries `price` -- never both
     if prop.get("rent"):
         parts.append(f"at ₹{prop['rent']}/mo")
-    if prop.get("amenities"):
-        parts.append(f"({prop['amenities']})")
+    elif prop.get("price"):
+        parts.append(f"at ₹{prop['price']}")
+    amenities = _amenity_words(prop.get("amenities"))
+    if amenities:
+        parts.append(f"({amenities})")
     return " ".join(parts) if parts else "the property you selected"
 
 
@@ -1200,7 +1230,13 @@ def _llm_extract_email(text: str, state: AppState) -> str:
 # inserts when a caller spells: "S-H-U-B-H-A-N-G-O-R. E. I". The space-only form
 # missed the hyphenated one, and the molding heuristic then produced
 # "S-H-U-B-H-A-N-G-O-R.E.I@gmail.com" -- spoken back to the caller as garbage.
-_SPELLED_OUT_RE = re.compile(r"(?:\b\w\b[\s.\-]+){2,}\b\w\b")
+_SPELLED_OUT_RE = re.compile(
+    # letters given one at a time: "s h u b" / "S-H-U-B" / "S. H. U. B"
+    r"(?:\b\w\b[\s.\-]+){2,}\b\w\b"
+    # or dictated in chunks, which STT returns hyphen-joined and usually capitalised:
+    # "SHU-BHANG-OREI"
+    r"|\b[A-Za-z]{2,8}(?:-[A-Za-z]{2,8}){1,}\b(?=[^\s]*@|\s|$)"
+)
 
 # Strict shape for an address we are willing to send mail to.
 _EMAIL_STRICT_RE = re.compile(
@@ -1249,9 +1285,48 @@ def _supported_by_text(email: str, text: str) -> bool:
     return True
 
 
+_SAID_A_SEPARATOR_RE = re.compile(r"\b(dash|hyphen|underscore|minus)\b", re.IGNORECASE)
+
+
+def _local_part_as_spoken(text: str) -> str:
+    """The portion of the caller's sentence before the "@" / "at" -- i.e. what
+    they said for the local part, so separators claimed there can be checked
+    without the domain's own "gmail dot com" confusing matters."""
+    split = re.split(r"@|\bat the rate\b|\bat\b", text or "", maxsplit=1, flags=re.IGNORECASE)
+    return split[0]
+
+
+def _strip_dictation_separators(email: str, text: str) -> str:
+    """Speech-to-text chops a dictated address into chunks and rejoins them with
+    punctuation the caller never uttered: "SHU-BHANG-OREI@gmail.com" and
+    "shubhang.orei@gmail.com" are both really shubhangorei@gmail.com. On a call a
+    genuine separator is spoken -- "dash", "hyphen", "dot" -- so a separator in
+    the local part is kept only if the corresponding word was actually said
+    before the "at". The domain is left alone; "gmail dot com" is unambiguous."""
+    local, at, domain = email.partition("@")
+    if not at:
+        return email
+    spoken = _local_part_as_spoken(text)
+    if "-" in local and not _SAID_A_SEPARATOR_RE.search(spoken):
+        local = local.replace("-", "")
+    # A dot is only an artefact when the address was dictated. A literal, already
+    # lowercase "john.doe@gmail.com" that STT recognised as one token is left
+    # alone -- stripping that would break a perfectly good address.
+    dictated = bool(_looks_spelled_out(text)) or re.search(r"[A-Z]{2,}", text or "")
+    if ("." in local and dictated
+            and not re.search(r"\b(dot|point|period)\b", spoken, re.IGNORECASE)):
+        local = local.replace(".", "")
+    return local + "@" + domain
+
+
 def _accept_email(candidate: str, text: str, state: AppState, how: str) -> str:
     """Normalise, then refuse anything malformed or unsupported by the caller."""
     email = (candidate or "").strip().strip(".,;:").lower()
+    normalised = _strip_dictation_separators(email, text)
+    if normalised != email:
+        logger.info(f"{_ctx(state)} extract_email: dropped dictation separators, "
+                    f"{email!r} -> {normalised!r} (caller never spoke them)")
+        email = normalised
     if not email or not _EMAIL_STRICT_RE.match(email):
         logger.warning(f"{_ctx(state)} extract_email: rejected {candidate!r} from {how} (bad shape)")
         return ""

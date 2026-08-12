@@ -150,7 +150,16 @@ active_calls: dict = {}
 _AMOUNT_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{2,3})+|\d{4,})(?!\.?\d)(?![A-Za-z])")
 
 
+_BHK_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven"}
+
+
 def clean_for_voice(reply: str) -> str:
+    # "4BHK" is read out as "four B-H-K" by TTS; say it the way a person would.
+    reply = re.sub(r"\b(\d+)\s*BHK\b",
+                   lambda m: f"{_BHK_WORDS.get(int(m.group(1)), m.group(1))} bedroom",
+                   reply, flags=re.IGNORECASE)
+    # the model also writes it as "four BHK", where the digit rule doesn't apply
+    reply = re.sub(r"\bBHK\b", "bedroom", reply)
     reply = re.sub(r"\*+", "", reply)
     reply = re.sub(r"#+\s*", "", reply)
     # Markdown list markers read aloud as "dash" / "one dot"; strip them before
