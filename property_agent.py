@@ -344,8 +344,6 @@ def load_preferences(state: AppState) -> dict:
 SYSTEM_PROMPT   = """You are a property assistant on a phone call. You cover properties to rent
 and to buy across major Indian cities. You are speaking, not writing.
 
-User's saved preferences: {preferences}
-
 Every city and locality we actually have, as "City: its localities":
 {known_locations}
 Never name a city or locality outside that list. When offering alternatives, pick from it.
